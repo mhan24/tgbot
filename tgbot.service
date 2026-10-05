@@ -1,0 +1,27 @@
+[Unit]
+Description=Setup Telegram Group Moderation Bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tgbot
+EnvironmentFile=/opt/tgbot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DB_PATH=/var/lib/tgbot/bot.sqlite3
+ExecStart=/usr/bin/python3 /opt/tgbot/bot.py
+Restart=always
+RestartSec=15
+StateDirectory=tgbot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
