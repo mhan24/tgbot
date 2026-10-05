@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+"""Telegram 群管：多群分发、验证、管理服务与持久化消息清理。仅使用标准库。"""
 from appeals import Appeals
 from milestones import Milestones
-"""Telegram moderation bot. Python standard library only."""
 import html
 import json
 import logging
@@ -24,6 +24,7 @@ from attention import Attention
 from history import History
 from members import Members
 from jev_ads import JevAds
+from moderation import Moderation
 
 LOG = logging.getLogger('groupbot')
 # Chinese triggers remain usable for existing members, while Telegram's
@@ -88,10 +89,9 @@ class Bot:
         'CHECKIN_MAX': {'type': 'int', 'min': 1, 'max': 1000, 'label': '签到积分上限'},
         'MESSAGE_POINTS': {'type': 'int', 'min': 1, 'max': 100, 'label': '每条发言积分'},
         'MESSAGE_DAILY_LIMIT': {'type': 'int', 'min': 0, 'max': 1000, 'label': '每日发言积分上限'},
-        'MUTE_SECONDS': {'type': 'int', 'min': 60, 'max': 2592000, 'label': '三次警告后的禁言秒数'},
+        'MUTE_SECONDS': {'type': 'int', 'min': 60, 'max': 2592000, 'label': '管理员默认禁言秒数'},
         'VERIFY_SECONDS': {'type': 'int', 'min': 30, 'max': 300, 'label': '入群验证秒数'},
         'DELETE_AFTER_SECONDS': {'type': 'int', 'min': 0, 'max': 3600, 'label': '群内机器人消息自动删除秒数'},
-        'GROUP_COMMAND_LIMIT': {'type': 'int', 'min': 1, 'max': 100, 'label': '成员每日群内命令次数'},
         'HISTORY_MESSAGES': {'type': 'int', 'min': 0, 'max': 500, 'label': 'AI 历史记录保留条数'},
         'HISTORY_CONTEXT': {'type': 'int', 'min': 0, 'max': 200, 'label': '每次 AI 引用历史条数'},
         'JEV_ENABLED': {'type': 'bool', 'label': 'Jev 手动广告举报'},
@@ -114,7 +114,6 @@ class Bot:
         # Seconds before the bot removes its own group messages and other bots' group messages.
         self.delete_after = int(cfg.get('DELETE_AFTER_SECONDS', 30))
         # Group operations a regular member may run per day before being sent to private chat.
-        self.group_command_limit = int(cfg.get('GROUP_COMMAND_LIMIT', 3))
         self.checkin_min = int(cfg.get('CHECKIN_MIN', 1))
         self.checkin_max = int(cfg.get('CHECKIN_MAX', 5))
         self.message_points = int(cfg.get('MESSAGE_POINTS', 1))
@@ -128,7 +127,6 @@ class Bot:
             'MUTE_SECONDS': self.mute_seconds,
             'VERIFY_SECONDS': self.verify_seconds,
             'DELETE_AFTER_SECONDS': self.delete_after,
-            'GROUP_COMMAND_LIMIT': self.group_command_limit,
             'HISTORY_MESSAGES': int(cfg.get('HISTORY_MESSAGES', 50)),
             'HISTORY_CONTEXT': int(cfg.get('HISTORY_CONTEXT', 50)),
             'JEV_ENABLED': str(cfg.get('JEV_ENABLED', '1')).lower() in ('1', 'true', 'yes', 'on'),
@@ -152,18 +150,23 @@ class Bot:
         CREATE TABLE IF NOT EXISTS verification(uid INTEGER PRIMARY KEY, chat INTEGER, kind TEXT,
           nonce TEXT, answer INTEGER, expires INTEGER, attempts INTEGER DEFAULT 0, passed INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS warnings(uid INTEGER PRIMARY KEY,count INTEGER DEFAULT 0,mute_until INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS violations(event TEXT PRIMARY KEY,uid INTEGER,count INTEGER,reason TEXT,done INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS violations(event TEXT PRIMARY KEY,uid INTEGER,count INTEGER,reason TEXT,done INTEGER DEFAULT 0,punished INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS processed(id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,target INTEGER,action TEXT,detail TEXT);
         CREATE TABLE IF NOT EXISTS blacklist(uid INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,reason TEXT);
         CREATE TABLE IF NOT EXISTS upgrades(uid INTEGER PRIMARY KEY,tag TEXT,at INTEGER,total INTEGER);
         CREATE TABLE IF NOT EXISTS deletions(chat INTEGER,message_id INTEGER,attempts INTEGER DEFAULT 0,due INTEGER,PRIMARY KEY(chat,message_id));
         CREATE TABLE IF NOT EXISTS verification_prompts(chat INTEGER,message_id INTEGER,uid INTEGER,nonce TEXT,expires INTEGER,PRIMARY KEY(chat,message_id));
-        CREATE TABLE IF NOT EXISTS command_usage(uid INTEGER,day TEXT,count INTEGER DEFAULT 0,notified INTEGER DEFAULT 0,PRIMARY KEY(uid,day));
         CREATE TABLE IF NOT EXISTS whitelist(uid INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,note TEXT);
         CREATE TABLE IF NOT EXISTS user_activity(uid INTEGER PRIMARY KEY, last_active INTEGER);
         CREATE TABLE IF NOT EXISTS group_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         ''')
+        if 'punished' not in {row[1] for row in self.db.execute('PRAGMA table_info(violations)')}:
+            self.db.execute('ALTER TABLE violations ADD COLUMN punished INTEGER DEFAULT 0')
+            self.db.commit()
+        with self.db:
+            self.db.execute('DROP TABLE IF EXISTS command_usage')
+            self.db.execute("DELETE FROM group_settings WHERE key='GROUP_COMMAND_LIMIT'")
         for setting in self.db.execute('SELECT key,value FROM group_settings').fetchall():
             if setting['key'] not in self.GROUP_SETTING_SPECS:
                 continue
@@ -188,6 +191,7 @@ class Bot:
                                context_messages=self.setting_values['HISTORY_CONTEXT'])
         self.members = Members(self)
         self.jev = JevAds(self)
+        self.moderation = Moderation(self)
         self.appeals = Appeals(self)
         self.milestones = Milestones(self)
         self.group_manager_root = False
@@ -254,7 +258,6 @@ class Bot:
         self.mute_seconds = values['MUTE_SECONDS']
         self.verify_seconds = values['VERIFY_SECONDS']
         self.delete_after = values['DELETE_AFTER_SECONDS']
-        self.group_command_limit = values['GROUP_COMMAND_LIMIT']
         self.upgrade_points = values['UPGRADE_POINTS']
         self.upgrade_tag = values['UPGRADE_TAG']
         self.ai_cooldown_seconds = values['AI_COOLDOWN_SECONDS']
@@ -306,31 +309,6 @@ class Bot:
             return False
         cmd = POINTS_COMMAND_ALIASES.get(name[0].lower(), name[0].lower())
         return cmd in ('/help', '/checkin', '/points', '/rank', '/milestones', '/bin', '/ai')
-
-    def group_command_allowed(self, msg):
-        """Regular members get a limited number of group operations per day, then must use private chat."""
-        user = msg.get('from', {})
-        uid = user.get('id')
-        if not uid or user.get('is_bot') or msg.get('sender_chat') or uid == self.bot_id:
-            return True
-        if self.exempt(uid):
-            return True
-        day = self.points.day()
-        row = self.db.execute('SELECT count,notified FROM command_usage WHERE uid=? AND day=?', (uid, day)).fetchone()
-        used = row['count'] if row else 0
-        if used < self.group_command_limit:
-            with self.db:
-                self.db.execute('INSERT INTO command_usage(uid,day,count) VALUES(?,?,1) '
-                                'ON CONFLICT(uid,day) DO UPDATE SET count=count+1', (uid, day))
-            return True
-        # Over the limit: stop listening in the group and point the member at private chat.
-        if not row or not row['notified']:
-            with self.db:
-                self.db.execute('INSERT INTO command_usage(uid,day,count,notified) VALUES(?,?,0,1) '
-                                'ON CONFLICT(uid,day) DO UPDATE SET notified=1', (uid, day))
-            self.send(self.group, f'你今天已在群内使用机器人 {self.group_command_limit} 次，'
-                                  f'请私聊机器人继续操作，群内不再响应。')
-        return False
 
     def schedule_delete(self, chat, message_id):
         if self.delete_after <= 0 or chat is None or not message_id or chat != self.group:
@@ -405,7 +383,7 @@ class Bot:
         return bool(self.db.execute('SELECT 1 FROM blacklist WHERE uid=?', (uid,)).fetchone())
 
     def whitelisted(self, uid):
-        """Trusted members skip ad detection, the daily group limit and three-day auto-blacklisting.
+        """Trusted members skip Jev review, verification and three-day auto-blacklisting.
         A blacklist entry always wins, so whitelisting can never undo a ban."""
         if not uid or self.blacklisted(uid):
             return False
@@ -461,18 +439,21 @@ class Bot:
                             'ON CONFLICT(uid) DO UPDATE SET at=excluded.at,actor=excluded.actor,reason=excluded.reason',
                             (uid, int(time.time()), actor, reason[:200]))
             self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
+            self.db.execute('DELETE FROM whitelist WHERE uid=?', (uid,))
             self.db.execute('UPDATE warnings SET mute_until=0 WHERE uid=?', (uid,))
         self.call('banChatMember', chat_id=self.group, user_id=uid, revoke_messages=True)
         self.audit(actor, uid, 'blacklist', reason)
         return True
 
-    def unblacklist_member(self, uid):
-        with self.db:
-            self.db.execute('DELETE FROM blacklist WHERE uid=?', (uid,))
+    def unblacklist_member(self, uid, actor=0):
+        """Clear local punishment only after Telegram successfully lifts the ban."""
         self.call('unbanChatMember', chat_id=self.group, user_id=uid, only_if_banned=True)
         with self.db:
+            self.db.execute('DELETE FROM blacklist WHERE uid=?', (uid,))
+            self.db.execute('DELETE FROM whitelist WHERE uid=?', (uid,))
             self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
-        self.audit(0, uid, 'unblacklist')
+            self.db.execute('UPDATE warnings SET count=0,mute_until=0 WHERE uid=?', (uid,))
+        self.audit(actor, uid, 'unblacklist')
 
     def subscribed(self, uid):
         member = self.call('getChatMember', chat_id=self.channel, user_id=uid)
@@ -484,23 +465,15 @@ class Bot:
                   permissions={key: False for key in PERMISSIONS}, use_independent_chat_permissions=True,
                   until_date=until)
 
-    def restore(self, uid):
+    def restore(self, uid, clear_mute=False):
         row = self.db.execute('SELECT mute_until FROM warnings WHERE uid=?', (uid,)).fetchone()
-        if row and row['mute_until'] > time.time():
+        if not clear_mute and row and row['mute_until'] > time.time():
             self.restrict(uid, row['mute_until'])
             return
         permissions = self.call('getChat', chat_id=self.group)['permissions']
         self.call('restrictChatMember', chat_id=self.group, user_id=uid,
                   permissions={key: permissions.get(key, False) for key in PERMISSIONS},
                   use_independent_chat_permissions=True)
-
-    def delete(self, message):
-        try:
-            self.call('deleteMessage', chat_id=self.group, message_id=message['message_id'])
-        except APIError as exc:
-            if exc.code == 400 and 'message to delete not found' in exc.description.lower():
-                return
-            raise
 
     def start_verification(self, user, kind, chat=None):
         uid = user['id']
@@ -643,16 +616,17 @@ class Bot:
                 self.db.execute('INSERT INTO violations(event,uid,count,reason) VALUES(?,?,?,?)', (event, uid, count, reason))
         suffix = ''
         if count >= 3:
-            until = int(time.time()) + self.mute_seconds
             if uid < 0:
-                self.call('banChatSenderChat', chat_id=self.group, sender_chat_id=uid)
+                if not previous or not previous['punished']:
+                    self.call('banChatSenderChat', chat_id=self.group, sender_chat_id=uid)
                 suffix = '\n已禁止该频道在群内发言。'
             else:
-                self.restrict(uid, until)
-                with self.db:
-                    self.db.execute('UPDATE warnings SET mute_until=? WHERE uid=?', (until, uid))
-                self.blacklist_member(uid, actor, f'警告累计 {count} 次：{reason}')
-                suffix = f'\n已禁言 {self.mute_seconds // 3600} 小时，并移出本群、加入黑名单。'
+                if not previous or not previous['punished']:
+                    self.blacklist_member(uid, actor, f'警告累计 {count} 次：{reason}')
+                suffix = '\n已移出本群、加入黑名单，并请求删除全部群消息。'
+        if count >= 3:
+            with self.db:
+                self.db.execute('UPDATE violations SET punished=1 WHERE event=?', (event,))
         label = f'<a href="tg://user?id={uid}">该成员</a>' if uid > 0 else f'频道 {uid}'
         if not silent:
             self.send(self.group, f'⚠️ {label} 警告 {count}/3：{html.escape(reason)}{suffix}')
@@ -687,12 +661,7 @@ class Bot:
         user = msg['from']
         if user.get('is_bot') or user['id']==self.bot_id:
             return True
-        result = self.handle_points_command(msg, cmd)
-        try:
-            self.call('deleteMessage', chat_id=msg.get('chat', {}).get('id', self.group), message_id=msg['message_id'])
-        except APIError as exc:
-            LOG.warning('Could not delete points command message=%s code=%s', msg['message_id'], exc.code)
-        return result
+        return self.handle_points_command(msg, cmd)
 
     def handle_points_command(self, msg, cmd):
         user = msg['from']
@@ -934,11 +903,8 @@ class Bot:
                     f'• 入群验证：先关注关联频道，再完成算术题，{verify_time} 内最多答错 3 次\n'
                     '• 解封申请：被拉黑后私聊 /appeal 理由；也可先 /appeal 再填写，/cancel 取消填写；每天最多一次，待审不可重复提交')
         admins = ('<b>仅管理员</b>\n'
-                  '• /warn [ID] [原因] — 警告，累计 3 次禁言、移出并拉黑\n'
-                  f'• /mute [ID] [分钟] — 默认 {self.mute_seconds // 60} 分钟；/unmute [ID] 解除禁言\n'
-                  '• /warnings [ID] 查看警告；/resetwarn [ID] 清零警告，不自动解封\n'
-                  '• /ban [ID] [原因] — 拉黑并删除其消息；/unban [ID] 解封\n'
-                  '• /white [ID] [备注]、/unwhite [ID]、/whitelist — 白名单管理\n'
+                  '• /manage [ID/@用户名] — 回复成员消息打开管理面板；查看警告、禁言、拉黑、解封和白名单，全部使用按钮\n'
+                  '• /manage — 查看本群黑白名单，选择成员管理\n'
                   '• 空投审核：普通成员申请由任一群管理员同意或拒绝；管理员每日额度外的申请仍需群主批准\n'
                   '• 多群管理：群主在新群发送 /group_add 登记，私聊 /groups 启停群组、切换当前私聊群；数据各自独立\n'
                   '• /audit 最近 100 条全部日志；/audit ID 查看该用户日志；/status 运行状态；/help 查看此完整功能帮助')
@@ -947,20 +913,37 @@ class Bot:
                  '• /appeals — 查看含昵称提及、用户名和 ID 的待审申请，点击批准或拒绝；请先私聊 /start 以接收申请通知\n'
                  '• 批准后解除黑名单并清零警告，用户需重新申请入群；处理结果私聊通知申请人')
         automatic = (f'<b>自动规则</b>\n'
-                     f'• 达到 {self.upgrade_points} 分发送「第 N 位达标」恭喜消息，保留在群内；已有自定义标签也会通知\n'
+                     f'• 达到 {self.upgrade_points} 分发送「第 N 位达标」恭喜消息，30 秒后自动删除；已有自定义标签也会通知\n'
                      f'• 符合条件时升级为「{html.escape(self.upgrade_tag)}」，不覆盖已有标签\n'
                      '• 连续 3 个完整自然日每天签到、没有正常发言：拉黑并清零积分\n'
                      '• 广告举报仅通过回复消息发送 /report 触发；群内投票确认后处罚\n'
-                     '• 签到、积分、排行榜命令源消息处理后删除；积分与榜单结果仅私聊展示')
-        footer = (f'普通成员每天群内机器人操作上限：{self.group_command_limit} 次；管理员及白名单豁免。\n'
+                     '• 用户命令源消息保留；普通机器人消息 30 秒后删除；积分与榜单结果仅私聊展示')
+        footer = ('群内机器人操作不设每日次数上限；签到、空投额度和 AI 冷却仍按各自规则执行。\n'
                   '管理目标可回复消息指定，或填写数字 ID / 已知 @用户名；匿名管理员请切换个人身份。')
-        text = f'🤖 <b>功能菜单 · 2026-10-01</b>\n\n{everyone}\n\n{admins}\n\n{owner}\n\n{automatic}\n\n{footer}'
+        text = f'🤖 <b>功能菜单 · 2026-10-05</b>\n\n{everyone}\n\n{admins}\n\n{owner}\n\n{automatic}\n\n{footer}'
         self.send(chat, text, reply_parameters={'message_id': msg['message_id'], 'allow_sending_without_reply': True},
                   link_preview_options={'is_disabled': True})
         return True
 
     def command(self, msg, update_id):
-        """处理群内管理员命令；先核验身份，再解析回复消息或显式目标。"""
+        """Public moderation entry; retired commands are deliberately not aliases."""
+        words = msg.get('text', '').split()
+        if not words:
+            return False
+        command = words[0].split('@', 1)
+        if len(command) > 1 and command[1].lower() != self.username.lower():
+            return False
+        if command[0].lower() == '/manage':
+            return self.moderation.command(msg)
+        if command[0].lower() in ('/audit', '/status'):
+            return self._moderation_action(msg, update_id)
+        return False
+
+    def _moderation_action(self, msg, update_id):
+        """内部管理服务：面板调用旧动作解析器；不向用户注册独立管理命令。
+
+        每次仍重新核验管理员和目标身份。公开入口只允许 /manage、/audit、/status。
+        """
         text = msg.get('text', '')
         parts = text.split()
         if not parts:
@@ -969,26 +952,13 @@ class Bot:
         if len(first) > 1 and first[1].lower() != self.username.lower():
             return False
         cmd = first[0].lower()
-        if cmd not in ('/warn', '/mute', '/unmute', '/warnings', '/resetwarn', '/ban', '/unban',
-                       '/white', '/unwhite', '/whitelist', '/status',
+        if cmd not in ('/warn', '/mute', '/unmute', '/resetwarn', '/ban', '/unban',
+                       '/white', '/unwhite', '/status',
                        '/audit'):
             return False
         uid = msg.get('from', {}).get('id')
         # Anonymous/sender-chat commands cannot be attributed and are refused.
         if msg.get('sender_chat') or not uid or not self.admin(uid):
-            return True
-        if cmd == '/whitelist':
-            rows = self.db.execute('SELECT * FROM whitelist ORDER BY at').fetchall()
-            if not rows:
-                self.send(self.group, '当前白名单为空。用 /white [ID] 或回复成员消息添加。')
-                return True
-            lines = [f'✅ 白名单（{len(rows)} 人）', '豁免：广告检测、群内次数限制、三日自动黑名单、AI 冷却与入群验证']
-            for row in rows:
-                name = self.db.execute('SELECT name FROM point_users WHERE uid=?', (row['uid'],)).fetchone()
-                lines.append(f'• {html.escape(str(name[0] if name else "").replace("@", "＠"))}（ID {row["uid"]}）'
-                             f'{("　备注：" + row["note"]) if row["note"] else ""}')
-            lines.append('移除：/unwhite 用户ID 或回复其消息发送 /unwhite。')
-            self.send(self.group, '\n'.join(lines))
             return True
         if cmd == '/audit':
             args = parts[1:]
@@ -1037,7 +1007,7 @@ class Bot:
             family = self.db.execute("SELECT count(*) FROM upgrades WHERE tag=?", (self.upgrade_tag,)).fetchone()[0]
             tags = '正常' if self.can_manage_tags else '缺少 can_manage_tags 权限，已停用'
             white = self.db.execute('SELECT count(*) FROM whitelist').fetchone()[0]
-            self.send(self.group, f'✅ 群管运行中\n待验证：{pending}\n黑名单：{banned}\n白名单：{white} 人\n标签升级：累计 {self.upgrade_points} 分改为「{self.upgrade_tag}」，已升级 {family} 人（{tags}）\n警告累计 3 次禁言 {self.mute_seconds // 3600} 小时并移出本群。')
+            self.send(self.group, f'✅ 群管运行中\n待验证：{pending}\n黑名单：{banned}\n白名单：{white} 人\n标签升级：累计 {self.upgrade_points} 分改为「{self.upgrade_tag}」，已升级 {family} 人（{tags}）\n警告累计 3 次拉黑并删除消息。')
             return True
         args = parts[1:]
         replied = msg.get('reply_to_message', {})
@@ -1082,9 +1052,9 @@ class Bot:
             if pending:
                 self.send(self.group, '该成员尚未完成入群验证，请先完成验证。')
                 return True
+            self.restore(target, clear_mute=True)
             with self.db:
                 self.db.execute('UPDATE warnings SET mute_until=0 WHERE uid=?', (target,))
-            self.restore(target)
             self.send(self.group, f'已解除用户 {target} 的禁言。')
             self.audit(uid, target, 'unmute')
         elif cmd == '/resetwarn':
@@ -1103,15 +1073,11 @@ class Bot:
             if not self.blacklisted(target):
                 self.send(self.group, f'用户 {target} 不在黑名单中。')
                 return True
-            self.call('unbanChatMember', chat_id=self.group, user_id=target, only_if_banned=True)
-            with self.db:
-                self.db.execute('DELETE FROM blacklist WHERE uid=?', (target,))
-                self.db.execute('DELETE FROM verification WHERE uid=?', (target,))
-            self.send(self.group, f'已解除用户 {target} 的黑名单，可重新申请入群。')
-            self.audit(uid, target, 'unblacklist')
+            self.unblacklist_member(target, uid)
+            self.send(self.group, f'已解除用户 {target} 的黑名单并清零警告，可重新申请入群。')
         elif cmd == '/white':
             if self.blacklisted(target):
-                self.send(self.group, f'用户 {target} 在黑名单中，黑名单优先。如需加白名单请先 /unban。')
+                self.send(self.group, f'用户 {target} 在黑名单中，黑名单优先。如需加白名单请先在 /manage 面板解封。')
                 return True
             note = ' '.join(args)[:100]
             pending = self.db.execute("SELECT kind FROM verification WHERE uid=? AND kind!='approved'", (target,)).fetchone()
@@ -1130,7 +1096,7 @@ class Bot:
                 except APIError as exc:
                     if pending['kind'] != 'request' or exc.code != 400 or 'user_already_participant' not in exc.description.lower():
                         LOG.warning('Whitelist restore failed uid=%s: %s', target, exc)
-            self.send(self.group, f'✅ 已将用户 {target} 加入白名单：豁免广告检测、群内次数限制、三日自动黑名单、AI 冷却与入群验证。')
+            self.send(self.group, f'✅ 已将用户 {target} 加入白名单：豁免广告检测、三日自动黑名单、AI 冷却与入群验证。')
             self.audit(uid, target, 'whitelist', note)
         elif cmd == '/unwhite':
             if not self.db.execute('SELECT 1 FROM whitelist WHERE uid=?', (target,)).fetchone():
@@ -1140,9 +1106,6 @@ class Bot:
                 self.db.execute('DELETE FROM whitelist WHERE uid=?', (target,))
             self.send(self.group, f'已移除用户 {target} 的白名单，恢复正常限制。')
             self.audit(uid, target, 'unwhitelist')
-        elif cmd == '/warnings':
-            row = self.db.execute('SELECT count FROM warnings WHERE uid=?', (target,)).fetchone()
-            self.send(self.group, f'用户 {target}：{row[0] if row else 0} 次警告。')
         return True
 
     def joined(self, user):
@@ -1160,6 +1123,8 @@ class Bot:
             return
         self.members.observe(update)
         if 'callback_query' in update:
+            if self.moderation.callback(update['callback_query']):
+                return
             if self.appeals.callback(update['callback_query']):
                 return
             if self.jev.callback(update['callback_query']):
@@ -1211,6 +1176,8 @@ class Bot:
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and self.bin_command(msg):
                 return
+            if msg['chat'].get('type') == 'private' and 'message' in update and self.command(msg, update['update_id']):
+                return
             if msg['chat']['id'] != self.group:
                 if msg['chat'].get('type') == 'private' and msg.get('text', '').startswith('/start'):
                     self.send(msg['chat']['id'], '请从群组入口申请加入，然后完成本机器人发送的频道关注与人机验证。\nhttps://t.me/setupode')
@@ -1239,8 +1206,6 @@ class Bot:
                     self.db.execute('INSERT INTO user_activity(uid,last_active) VALUES(?,?) ON CONFLICT(uid) DO UPDATE SET last_active=excluded.last_active', (uid, int(msg.get('date') or time.time())))
             if 'message' in update and not self.whitelisted(uid):
                 self.attention.observed(msg)
-            if 'message' in update and self.is_bot_operation(msg) and not self.group_command_allowed(msg):
-                return
             if 'message' in update and self.help_command(msg):
                 return
             if 'message' in update and self.ai.command(msg):
@@ -1258,7 +1223,6 @@ class Bot:
                 return
             pending = self.db.execute("SELECT 1 FROM verification WHERE uid=? AND kind!='approved'", (uid,)).fetchone()
             if pending and not self.whitelisted(uid):
-                self.delete(msg)
                 return
             content = any(msg.get(key) for key in ('text','photo','video','animation','audio','voice','video_note','document','sticker','poll','contact','location','venue','dice'))
             if 'message' in update and content and not msg.get('text','').startswith('/') and self.avatar_visible(uid) is True:
@@ -1868,6 +1832,17 @@ class Bot:
                 except ValueError: aid = -1
                 for tenant in self.managed_bots.values():
                     if tenant.db.execute('SELECT 1 FROM appeals WHERE id=? AND state="pending"', (aid,)).fetchone(): return tenant
+            if data.startswith('mod:'):
+                fields = data.split(':')
+                if len(fields) == 4:
+                    try:
+                        gid = int(fields[1])
+                        tenant = self.managed_bots.get(gid)
+                        state = self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?', (gid,)).fetchone()
+                        return tenant if tenant and state and state['enabled'] else None
+                    except ValueError:
+                        return None
+                return None
             if data.startswith('rank:'):
                 fields=data.split(':')
                 if len(fields)==4:

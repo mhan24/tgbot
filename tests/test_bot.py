@@ -87,7 +87,8 @@ class Tests(unittest.TestCase):
         self.bot.warn(2, '2', 'test')
         self.bot.warn(2, '2', 'test')
         self.assertEqual(self.bot.db.execute('SELECT count FROM warnings').fetchone()[0], 3)
-        self.assertEqual(sum(m == 'restrictChatMember' for m, _ in self.api.calls), 1)
+        self.assertEqual(sum(m == 'restrictChatMember' for m, _ in self.api.calls), 0)
+        self.assertEqual(sum(m == 'banChatMember' for m, _ in self.api.calls), 1)
 
     def test_warning_failure_retry_does_not_double_count(self):
         self.api.failure = 'sendMessage'
@@ -98,15 +99,15 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.bot.db.execute('SELECT count FROM warnings').fetchone()[0], 1)
 
     def test_non_admin_cannot_mute(self):
-        self.bot.command({'text': '/mute 3', 'from': {'id': 2}}, 10)
+        self.bot._moderation_action({'text': '/mute 3', 'from': {'id': 2}}, 10)
         self.assertFalse(any(m == 'restrictChatMember' for m, _ in self.api.calls))
 
     def test_admin_can_mute_but_not_admin_target(self):
-        self.bot.command({'text': '/mute 2 60', 'from': {'id': 1}}, 10)
+        self.bot._moderation_action({'text': '/mute 2 60', 'from': {'id': 1}}, 10)
         restrict = [d for m, d in self.api.calls if m == 'restrictChatMember']
         self.assertEqual(len(restrict), 1)
         self.assertAlmostEqual(restrict[0]['until_date'], time.time() + 3600, delta=3)
-        self.bot.command({'text': '/mute 1', 'from': {'id': 1}}, 11)
+        self.bot._moderation_action({'text': '/mute 1', 'from': {'id': 1}}, 11)
         self.assertEqual(sum(m == 'restrictChatMember' for m, _ in self.api.calls), 1)
 
     def test_direct_join_restricts_and_approval_not_challenged_twice(self):
@@ -152,7 +153,7 @@ class Tests(unittest.TestCase):
     def test_ban_command_removes_and_blacklists(self):
         msg = {'chat': {'id': -1}, 'text': '/ban 广告', 'from': {'id': 1},
                'reply_to_message': {'from': {'id': 2, 'is_bot': False}}}
-        self.bot.command(msg, 1)
+        self.bot._moderation_action(msg, 1)
         self.assertEqual(self.bot.db.execute('SELECT uid FROM blacklist').fetchone()[0], 2)
         self.assertEqual([d['user_id'] for m, d in self.api.calls if m == 'banChatMember'], [2])
 
@@ -160,7 +161,7 @@ class Tests(unittest.TestCase):
         for target in (self.bot.bot_id, 1):
             msg = {'chat': {'id': -1}, 'text': '/ban', 'from': {'id': 1},
                    'reply_to_message': {'from': {'id': target, 'is_bot': False}}}
-            self.bot.command(msg, 1)
+            self.bot._moderation_action(msg, 1)
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM blacklist').fetchone()[0], 0)
         self.assertFalse(any(m == 'banChatMember' for m, _ in self.api.calls))
 
@@ -183,7 +184,7 @@ class Tests(unittest.TestCase):
             self.bot.db.execute("INSERT INTO blacklist(uid,at,actor,reason) VALUES(2,0,0,'t')")
         msg = {'chat': {'id': -1}, 'text': '/unban', 'from': {'id': 1},
                'reply_to_message': {'from': {'id': 2, 'is_bot': False}}}
-        self.bot.command(msg, 1)
+        self.bot._moderation_action(msg, 1)
         self.assertFalse(self.bot.blacklisted(2))
         self.assertEqual([d['user_id'] for m, d in self.api.calls if m == 'unbanChatMember'], [2])
 
@@ -194,47 +195,14 @@ class Tests(unittest.TestCase):
     def group_sends(self):
         return [d['text'] for m, d in self.api.calls if m == 'sendMessage' and d['chat_id'] == self.bot.group]
 
-    def test_three_group_operations_allowed_then_redirected(self):
-        for i in range(1, 4):
-            self.bot.handle(self.op(i))
-        self.assertEqual(self.bot.db.execute('SELECT count FROM command_usage').fetchone()[0], 3)
-        self.api.calls.clear()
-        self.bot.handle(self.op(4, '/bin 45717360'))
-        self.assertTrue(any('请私聊机器人' in t for t in self.group_sends()))
-        self.api.calls.clear()
-        self.bot.handle(self.op(5, '/rank'))
-        self.assertEqual(self.group_sends(), [])
-
-    def test_admin_is_exempt_from_group_limit(self):
-        for i in range(1, 6):
-            self.bot.handle(self.op(i, '/rank', uid=1))
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM command_usage').fetchone()[0], 0)
-
-    def test_plain_chat_is_not_counted(self):
-        self.bot.handle(self.op(1, '普通聊天'))
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM command_usage').fetchone()[0], 0)
-
-    def test_other_bot_commands_are_not_group_operations(self):
-        self.assertFalse(self.bot.is_bot_operation({'text': '/rank@otherbot'}))
-        self.assertFalse(self.bot.is_bot_operation({'text': '/ai@otherbot 你好'}))
-        self.assertTrue(self.bot.is_bot_operation({'text': '/rank@testbot'}))
-        self.assertTrue(self.bot.is_bot_operation({'text': '/ai@testbot 你好'}))
-
-    def test_limit_is_per_day(self):
-        msg = {'chat': {'id': self.bot.group, 'type': 'supergroup'}, 'message_id': 1,
-               'from': {'id': 2, 'first_name': 'U'}, 'text': '/rank'}
-        for _ in range(3):
-            self.assertTrue(self.bot.group_command_allowed(msg))
-        self.assertFalse(self.bot.group_command_allowed(msg))
-        with self.bot.db:
-            self.bot.db.execute('UPDATE command_usage SET day=?', ('2000-01-01',))
-        self.assertTrue(self.bot.group_command_allowed(msg))
-
-    def test_private_chat_is_not_limited(self):
-        for i in range(1, 6):
-            self.bot.handle({'update_id': i, 'message': {'chat': {'id': 2, 'type': 'private'},
-                            'message_id': i, 'from': {'id': 2, 'first_name': 'U'}, 'text': '/rank'}})
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM command_usage').fetchone()[0], 0)
+    def test_group_operations_unlimited_and_source_messages_retained(self):
+        for uid in (1, 2):
+            self.api.calls.clear()
+            for i in range(1, 11):
+                self.bot.handle(self.op(uid * 100 + i, '/help', uid=uid))
+            self.assertEqual(len(self.group_sends()), 10)
+            self.assertFalse(any(method == 'deleteMessage' for method, _ in self.api.calls))
+        self.assertIsNone(self.bot.db.execute("SELECT 1 FROM sqlite_master WHERE name='command_usage'").fetchone())
 
     def test_group_messages_are_queued_private_are_not(self):
         self.bot.send(self.bot.group, 'group hello')
@@ -336,7 +304,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn('/cleaninactive', text)
         for removed in ('原神启动', '/blockedwords', '/flagged', '/unflag'):
             self.assertNotIn(removed, text)
-        for token in ('/checkin', '/points', '/rank', '/bin', '/ai', '/warn', '/mute', '/airdrop', '/status'):
+        for token in ('/checkin', '/points', '/rank', '/bin', '/ai', '/manage', '/airdrop', '/status'):
             self.assertIn(token, text)
         self.assertEqual(self.api.calls[-1][1]['parse_mode'], 'HTML')
 

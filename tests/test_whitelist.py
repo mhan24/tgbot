@@ -21,7 +21,7 @@ class Tests(unittest.TestCase):
                 'from': {'id': uid, 'first_name': 'Vip'}, 'text': text, 'date': int(time.time())}
 
     def white(self, uid=2, mid=1):
-        self.bot.command({'chat': {'id': self.group}, 'text': f'/white {uid} 测试',
+        self.bot._moderation_action({'chat': {'id': self.group}, 'text': f'/white {uid} 测试',
                           'from': {'id': 1}, 'message_id': mid}, mid)
 
     def test_whitelisted_member_cannot_be_submitted_to_jev(self):
@@ -34,7 +34,7 @@ class Tests(unittest.TestCase):
         self.white()
         for i in range(1, 8):
             self.bot.handle({'update_id': i, 'message': self.msg(i, '/rank')})
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM command_usage').fetchone()[0], 0)
+        self.assertIsNone(self.bot.db.execute("SELECT 1 FROM sqlite_master WHERE name='command_usage'").fetchone())
 
     def test_whitelisted_member_is_exempt_from_three_day_blacklist(self):
         self.white()
@@ -60,28 +60,28 @@ class Tests(unittest.TestCase):
 
     def test_remove_from_whitelist_restores_limits(self):
         self.white()
-        self.bot.command({'chat': {'id': self.group}, 'text': '/unwhite 2',
+        self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/unwhite 2',
                           'from': {'id': 1}, 'message_id': 2}, 2)
         self.assertFalse(self.bot.whitelisted(2))
         for i in range(1, 5):
             self.bot.handle({'update_id': i, 'message': self.msg(i, '/rank')})
-        self.assertEqual(self.bot.db.execute('SELECT count FROM command_usage').fetchone()[0], 3)
+        self.assertIsNone(self.bot.db.execute("SELECT 1 FROM sqlite_master WHERE name='command_usage'").fetchone())
 
-    def test_whitelist_command_lists_entries(self):
+    def test_manage_lists_whitelist_entries(self):
         self.white()
         self.api.calls.clear()
-        self.bot.command({'chat': {'id': self.group}, 'text': '/whitelist',
+        self.bot.command({'chat': {'id': self.group}, 'text': '/manage',
                           'from': {'id': 1}, 'message_id': 3}, 3)
-        text = self.api.calls[-1][1]['text']
+        text = [d['text'] for method, d in self.api.calls if method == 'sendMessage'][-1]
         self.assertIn('白名单', text)
-        self.assertIn('豁免', text)
+        self.assertIn('2', text)
 
     def test_admin_is_exempt_without_whitelist(self):
         self.assertTrue(self.bot.exempt(1))
         self.assertFalse(self.bot.whitelisted(1))
 
     def test_non_admin_cannot_manage_whitelist(self):
-        self.bot.command({'chat': {'id': self.group}, 'text': '/white 2',
+        self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/white 2',
                           'from': {'id': 2}, 'message_id': 4}, 4)
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM whitelist').fetchone()[0], 0)
 

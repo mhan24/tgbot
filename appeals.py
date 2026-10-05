@@ -111,7 +111,7 @@ class Appeals:
         state='approved' if data[1]=='approve' else 'rejected'
         if not ban or ban['at']!=row['ban_at']:state='expired'
         if state=='approved':
-            try:self.bot.call('unbanChatMember',chat_id=self.bot.group,user_id=row['uid'],only_if_banned=True)
+            try:self.bot.unblacklist_member(row['uid'],q['from']['id'])
             except Exception:
                 answer('解封失败，申请仍待处理，请稍后重试。');return True
         with self.db:

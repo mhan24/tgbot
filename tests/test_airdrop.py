@@ -141,14 +141,14 @@ class Tests(unittest.TestCase):
         self.assertIn('tg://user?id=8',result)
         self.assertIn(grant['response'],[r['message_id'] for r in self.bot.db.execute('SELECT message_id FROM deletions')])
 
-    def test_airdrop_result_is_exempt_from_auto_deletion(self):
+    def test_airdrop_result_is_queued_for_auto_deletion(self):
         self.send_patcher.stop()
         with self.bot.db:
             aid=self.bot.db.execute("INSERT INTO airdrops(source,actor,minimum,prize,candidates,status,created) VALUES('auto-delete',1,10,'礼品','[]','drawn',1)").lastrowid
             self.bot.db.execute("INSERT INTO airdrop_winners(airdrop_id,ordinal,uid,name,balance) VALUES(?,1,2,'Winner',10)",(aid,))
         row=self.bot.db.execute("SELECT * FROM airdrops WHERE source='auto-delete'").fetchone()
         self.bot.airdrops.finalize(row,-1)
-        self.assertIsNone(self.bot.db.execute('SELECT chat FROM deletions WHERE message_id=1').fetchone())
+        self.assertIsNotNone(self.bot.db.execute('SELECT chat FROM deletions WHERE message_id=1').fetchone())
 
     def test_member_application_denied_by_admin_consumes_the_daily_request(self):
         msg=dict(self.msg,chat={'id':-1,'type':'supergroup'},

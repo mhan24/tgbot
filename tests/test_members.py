@@ -11,7 +11,7 @@ class Tests(unittest.TestCase):
         self.api.members[2]={'status':'member','user':self.user}
         self.bot.members.remember(self.user)
     def command(self,text,**extra):
-        self.bot.command({'chat':{'id':-1},'message_id':10,'from':{'id':1},'text':text,**extra},10)
+        self.bot._moderation_action({'chat':{'id':-1},'message_id':10,'from':{'id':1},'text':text,**extra},10)
     def test_ban_name_case_insensitive_and_explicit_target(self):
         self.command('/ban @ALICE spam',reply_to_message={'from':{'id':3}})
         bans=[d for m,d in self.api.calls if m=='banChatMember']

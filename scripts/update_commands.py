@@ -45,6 +45,9 @@ def main():
             # Preserve empty scopes so Telegram continues to inherit its fallback menu.
             new = [{'command': c['command'], 'description': descriptions[c['command']]}
                    for c in old if c['command'] in descriptions]
+            retired = {'warn', 'warnings', 'resetwarn', 'mute', 'unmute', 'ban', 'unban', 'white', 'unwhite', 'whitelist'}
+            if any(c['command'] in retired for c in old) and not any(c['command'] == 'manage' for c in new):
+                new.append({'command': 'manage', 'description': descriptions['manage']})
             checked += 1
             if new != old:
                 call('setMyCommands', commands=new, **kwargs)

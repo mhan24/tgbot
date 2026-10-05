@@ -356,7 +356,7 @@ class Airdrops:
         winners=self.winners(aid)
         if row['status']=='empty':
             result=self.bot.send(chat,f'空投 #{aid}\n发起人：{initiator}{approver}\n未开奖：没有找到同时满足 {row["minimum"]} 分门槛{active_text}、且已设置成员标签或头衔的在群用户。{proof}',
-                                 keep=chat==self.bot.group)
+                                 keep=False)
         else:
             active_info = f'\n活跃要求：{row["active_minutes"]} 分钟内发言' if row['active_minutes'] else ''
             winner_lines=[]
@@ -367,7 +367,7 @@ class Airdrops:
                 f'🎉 <b>空投开奖 #{aid}</b>\n发起人：{initiator}{approver}\n奖品：{safe(row["prize"])}\n'
                 f'最低积分：{row["minimum"]}{active_info}\n中奖人数：{len(winners)}/{row["winner_count"] or 1}\n\n'
                 f'中奖者：\n'+'\n'.join(winner_lines)+
-                f'\n\n本次不扣积分。请中奖者联系管理员领取奖品。{proof}',keep=True)
+                f'\n\n本次不扣积分。请中奖者联系管理员领取奖品。{proof}')
         with self.db:self.db.execute('UPDATE airdrops SET message_id=? WHERE id=?',(result['message_id'],aid))
         if chat!=self.bot.group and row['status']=='drawn':self.bot.send(chat,f'空投 #{aid} 已开奖，结果已发布到群。')
         return True
