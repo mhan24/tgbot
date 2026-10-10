@@ -25,6 +25,7 @@ from history import History
 from members import Members
 from jev_ads import JevAds
 from moderation import Moderation
+from exchange import Exchange, RateError
 
 LOG = logging.getLogger('groupbot')
 # Chinese triggers remain usable for existing members, while Telegram's
@@ -113,7 +114,6 @@ class Bot:
         self.upgrade_tag = cfg.get('UPGRADE_TAG', '家人')
         # Seconds before the bot removes its own group messages and other bots' group messages.
         self.delete_after = int(cfg.get('DELETE_AFTER_SECONDS', 30))
-        # Group operations a regular member may run per day before being sent to private chat.
         self.checkin_min = int(cfg.get('CHECKIN_MIN', 1))
         self.checkin_max = int(cfg.get('CHECKIN_MAX', 5))
         self.message_points = int(cfg.get('MESSAGE_POINTS', 1))
@@ -166,6 +166,10 @@ class Bot:
             self.db.commit()
         with self.db:
             self.db.execute('DROP TABLE IF EXISTS command_usage')
+            self.db.execute('DROP TABLE IF EXISTS shop_notifications')
+            self.db.execute('DROP TABLE IF EXISTS shop_products')
+            self.db.execute("DELETE FROM meta WHERE key='shop_initialized'")
+            self.db.execute("DELETE FROM group_settings WHERE key='SHOP_NOTIFICATIONS'")
             self.db.execute("DELETE FROM group_settings WHERE key='GROUP_COMMAND_LIMIT'")
         for setting in self.db.execute('SELECT key,value FROM group_settings').fetchall():
             if setting['key'] not in self.GROUP_SETTING_SPECS:
@@ -182,6 +186,7 @@ class Bot:
                 self.setting_overrides.discard(key)
         self._apply_group_settings()
         self.bin_lookup = BinLookup(self.db)
+        self.exchange = Exchange(self.db)
         self.points = Points(self.db, self.checkin_min, self.checkin_max,
                              self.message_points, self.message_daily_limit)
         self.airdrops = Airdrops(self)
@@ -278,6 +283,7 @@ class Bot:
 
     def call(self, method, **kwargs):
         keep = kwargs.pop('_keep', False)
+        delete_after = kwargs.pop('_delete_after', None)
         ai_history = kwargs.pop('_ai_history', False)
         if method == 'banChatMember':
             kwargs['revoke_messages'] = True
@@ -289,9 +295,9 @@ class Bot:
                 self.db.execute('DELETE FROM chat_history WHERE chat=? AND uid=?',
                                 (kwargs['chat_id'], kwargs['user_id']))
         if method == 'sendMessage' and isinstance(result, dict):
-            # Every message this bot posts to the group is queued for removal.
-            if not keep:
-                self.schedule_delete(kwargs.get('chat_id'), result.get('message_id'))
+            # Normal replies use the group timer; AI replies supply their own delay.
+            if delete_after is not None or not keep:
+                self.schedule_delete(kwargs.get('chat_id'), result.get('message_id'), seconds=delete_after)
             # Keep our own group messages in the AI's view of the conversation.
             self.history.record_outgoing(kwargs.get('chat_id'), result.get('message_id'), kwargs.get('text'),
                                          reply_to_id=(kwargs.get('reply_parameters') or {}).get('message_id'),
@@ -308,14 +314,15 @@ class Bot:
         if len(name) > 1 and name[1].lower() != self.username.lower():
             return False
         cmd = POINTS_COMMAND_ALIASES.get(name[0].lower(), name[0].lower())
-        return cmd in ('/help', '/checkin', '/points', '/rank', '/milestones', '/bin', '/ai')
+        return cmd in ('/help', '/checkin', '/points', '/rank', '/milestones', '/bin', '/rate', '/ai')
 
-    def schedule_delete(self, chat, message_id):
-        if self.delete_after <= 0 or chat is None or not message_id or chat != self.group:
+    def schedule_delete(self, chat, message_id, seconds=None):
+        delay = self.delete_after if seconds is None else seconds
+        if delay <= 0 or chat is None or not message_id or chat != self.group:
             return
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO deletions(chat,message_id,attempts,due) VALUES(?,?,0,?)',
-                            (chat, int(message_id), int(time.time()) + self.delete_after))
+                            (chat, int(message_id), int(time.time()) + delay))
 
     def drop_deletion(self, row):
         with self.db:
@@ -851,10 +858,26 @@ class Bot:
         try:
             return self.history.recent(msg['chat']['id'], exclude_id=msg.get('message_id'),
                                        limit=self.history.context_messages, conversation_only=True,
-                                       before_id=msg.get('message_id'), topic_id=msg.get('message_thread_id'))
+                                       before_id=msg.get('message_id'),
+                                       topic_id=msg.get('message_thread_id') if msg.get('is_topic_message') else None)
         except Exception:
             LOG.warning('History lookup failed chat=%s', msg.get('chat', {}).get('id'))
             return ''
+
+    def rate_command(self, msg):
+        parts = msg.get('text', '').split()
+        if not parts:
+            return False
+        cmd = parts[0].split('@', 1)
+        if cmd[0].lower() != '/rate' or (len(cmd) > 1 and cmd[1].lower() != self.username.lower()):
+            return False
+        try:
+            text = self.exchange.convert(parts[1:])
+        except RateError as exc:
+            text = str(exc)
+        self.send(msg['chat']['id'], text, reply_parameters={
+            'message_id': msg['message_id'], 'allow_sending_without_reply': True})
+        return True
 
     def bin_command(self, msg):
         parts = msg.get('text', '').split()
@@ -897,6 +920,7 @@ class Bot:
                     '• /rank — 私聊查看排行榜，每页 50 人，按钮翻页，不艾特榜单成员；多群时先选择群组\n'
                     f'• 达标榜：/milestones — 首次达到 {self.upgrade_points} 分的前 50 位，不要求特定标签；多群时先选择群组\n'
                     '• 多群管理：群主在新群发送 /group_add 登记，私聊 /groups 启用与切换；群数据独立\n'
+                    '• 汇率换算：/rate 100 USD CNY（或 /rate USD CNY）\n'
                     '• BIN 查询：/bin 45717360 — 输入 6–8 位 BIN\n'
                     '• 空投：/airdrop 最低积分 [活跃分钟] [中奖人数] 奖品 — 普通成员每天可申请一次；/airdrops [编号] 查看最近 20 条或详情\n'
                     f'• AI 问答：/ai 你的问题；或回复文字、图片、相册发送 /ai — {ai_cooldown}，管理员不限\n'
@@ -1174,7 +1198,7 @@ class Bot:
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and self.points_command(msg):
                 return
-            if msg['chat'].get('type') == 'private' and 'message' in update and self.bin_command(msg):
+            if msg['chat'].get('type') == 'private' and 'message' in update and (self.rate_command(msg) or self.bin_command(msg)):
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and self.command(msg, update['update_id']):
                 return
@@ -1214,7 +1238,7 @@ class Bot:
                 return
             if 'message' in update and self.points_command(msg):
                 return
-            if 'message' in update and self.bin_command(msg):
+            if 'message' in update and (self.rate_command(msg) or self.bin_command(msg)):
                 return
             if 'message' in update and self.command(msg, update['update_id']):
                 return
@@ -1334,7 +1358,7 @@ class Bot:
             return None
 
     def _setting_display(self, key, value):
-        if key == 'JEV_ENABLED':
+        if self.GROUP_SETTING_SPECS[key]['type'] == 'bool':
             return '开启' if value else '关闭'
         return str(value) if value != '' else '未设置'
 
@@ -1367,9 +1391,9 @@ class Bot:
         rows = []
         pair = []
         for key, label, value in values:
-            action = 't' if key == 'JEV_ENABLED' else 'e'
-            value_label = '开' if key == 'JEV_ENABLED' and tenant.setting_values[key] else (
-                '关' if key == 'JEV_ENABLED' else str(value))
+            action = 't' if spec['type'] == 'bool' else 'e'
+            value_label = '开' if spec['type'] == 'bool' and tenant.setting_values[key] else (
+                '关' if spec['type'] == 'bool' else str(value))
             button = {'text': f'{label} · {value_label}'[:60],
                       'callback_data': f'gs:{action}:{tenant.group}:{uid}:{key}'}
             pair.append(button)
@@ -1551,7 +1575,7 @@ class Bot:
             answer()
             return True
         if action == 't':
-            if key != 'JEV_ENABLED':
+            if key not in tenant.GROUP_SETTING_SPECS or tenant.GROUP_SETTING_SPECS[key]['type'] != 'bool':
                 answer('设置按钮无效。')
                 return True
             value = not tenant.setting_values[key]

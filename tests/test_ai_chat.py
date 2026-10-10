@@ -1,3 +1,5 @@
+import time
+
 import io
 import json
 import sqlite3
@@ -19,6 +21,26 @@ class Tests(unittest.TestCase):
         self.bot.username='testbot';self.pool=Pool();self.bot.ai.pool=self.pool
     def msg(self,mid=1,uid=2,text='/ai 你好',chat=-1):
         return {'chat':{'id':chat,'type':'private' if chat>0 else 'supergroup'},'from':{'id':uid},'message_id':mid,'text':text}
+    def test_thinking_reaction_lifecycle(self):
+        self.bot.ai.command(self.msg(uid=1))
+        reactions = [d for m, d in self.api.calls if m == 'setMessageReaction']
+        self.assertEqual(reactions[0]['reaction'], [{'type': 'emoji', 'emoji': '🤔'}])
+        self.assertEqual(reactions[0]['message_id'], 1)
+        self.bot.ai.drain()
+        reactions = [d for m, d in self.api.calls if m == 'setMessageReaction']
+        self.assertEqual(reactions[-1]['reaction'], [])
+        due = self.bot.db.execute('SELECT due FROM deletions').fetchone()[0]
+        self.assertAlmostEqual(due - time.time(), 600, delta=2)
+    def test_rejected_request_has_no_reaction(self):
+        self.bot.ai.command(self.msg(text='/ai'))
+        self.assertFalse(any(m == 'setMessageReaction' for m, d in self.api.calls))
+    def test_reaction_failure_does_not_block_answer(self):
+        self.api.failure = 'setMessageReaction'
+        with self.assertLogs('ai-chat'):
+            self.bot.ai.command(self.msg(uid=1))
+        self.bot.ai.drain()
+        self.assertTrue(any(m == 'sendMessage' for m, d in self.api.calls))
+
     def test_model_payload(self):
         with patch('ai_chat.urllib.request.urlopen',return_value=io.BytesIO(b'{"choices":[{"message":{"content":"ok"}}]}')) as request:
             self.assertEqual(completion(self.bot.cfg,'hi'),'ok')

@@ -197,11 +197,20 @@ class Tests(unittest.TestCase):
         trigger['chat']['id'] = -999
         self.assertEqual(self.h.reply_chain(trigger), '')
 
+    def test_regular_reply_thread_keeps_group_context(self):
+        self.h.record(self.msg(1, '先前讨论的重要背景'))
+        quoted = self.msg(2, '这个怎么样')
+        quoted['message_thread_id'] = 2
+        self.h.record(quoted)
+        trigger = self.msg(3, '/ai 结合上下文解释')
+        trigger['message_thread_id'] = 2
+        self.assertIn('先前讨论的重要背景', self.bot.ai_context(trigger))
+
     def test_forum_context_does_not_mix_topics(self):
-        first = self.msg(1, '话题一');first['message_thread_id'] = 10
-        second = self.msg(2, '话题二');second['message_thread_id'] = 20
+        first = self.msg(1, '话题一');first['message_thread_id'] = 10;first['is_topic_message'] = True
+        second = self.msg(2, '话题二');second['message_thread_id'] = 20;second['is_topic_message'] = True
         self.h.record(first);self.h.record(second)
-        trigger = self.msg(3, '/ai 解释');trigger['message_thread_id'] = 10
+        trigger = self.msg(3, '/ai 解释');trigger['message_thread_id'] = 10;trigger['is_topic_message'] = True
         context = self.bot.ai_context(trigger)
         self.assertIn('话题一', context)
         self.assertNotIn('话题二', context)

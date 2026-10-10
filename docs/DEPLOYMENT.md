@@ -1,6 +1,6 @@
 # 配置、部署与维护
 
-核对日期：2026-10-05。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。
+核对日期：2026-10-10。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。
 
 ## 1. 运行条件与凭据
 
@@ -17,7 +17,7 @@ Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并
 | `JEV_API_KEY` | 手动举报所用 Jev 凭据 |
 | `JEV_MODEL` / `JEV_ENABLED` | 默认 `jev-latest` / `1` |
 | `AI_BASE_URL` / `AI_API_KEY` | AI 的 OpenAI 兼容接口和凭据 |
-| `AI_MODEL` | 模板默认 `grok-4.7`；不开放群主修改 |
+| `AI_MODEL` | 模板默认 `sensenova-6.8-flash-lite`；不开放群主修改 |
 | `CHECKIN_MIN` / `CHECKIN_MAX` | 默认 `1` / `5` |
 | `MESSAGE_POINTS` / `MESSAGE_DAILY_LIMIT` | 默认 `1` / `5` |
 | `MUTE_SECONDS` / `VERIFY_SECONDS` | 默认 `86400` / `240` 秒 |

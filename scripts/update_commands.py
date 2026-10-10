@@ -48,6 +48,8 @@ def main():
             retired = {'warn', 'warnings', 'resetwarn', 'mute', 'unmute', 'ban', 'unban', 'white', 'unwhite', 'whitelist'}
             if any(c['command'] in retired for c in old) and not any(c['command'] == 'manage' for c in new):
                 new.append({'command': 'manage', 'description': descriptions['manage']})
+            if old and not any(c['command'] == 'rate' for c in new):
+                new.append({'command': 'rate', 'description': descriptions['rate']})
             checked += 1
             if new != old:
                 call('setMyCommands', commands=new, **kwargs)
