@@ -10,6 +10,7 @@ class Tests(unittest.TestCase):
         self.user={'id':2,'username':'Alice','first_name':'Alice'}
         self.api.members[2]={'status':'member','user':self.user}
         self.bot.members.remember(self.user)
+        self.addCleanup(self.bot.db.close)
     def command(self,text,**extra):
         self.bot._moderation_action({'chat':{'id':-1},'message_id':10,'from':{'id':1},'text':text,**extra},10)
     def test_ban_name_case_insensitive_and_explicit_target(self):
@@ -17,11 +18,21 @@ class Tests(unittest.TestCase):
         bans=[d for m,d in self.api.calls if m=='banChatMember']
         self.assertEqual([d['user_id'] for d in bans],[2])
         self.assertTrue(bans[0]['revoke_messages'])
-    def test_changed_name_fails_closed(self):
-        self.api.members[2]['user']={'id':2,'username':'renamed'}
-        self.command('/ban @Alice')
-        self.assertFalse(any(m=='banChatMember' for m,d in self.api.calls))
-        with self.assertRaises(ValueError):self.bot.members.resolve('@Alice')
+    def test_unresolvable_or_protected_targets_are_not_banned(self):
+        for case in ('renamed', 'unknown', 'removed_username', 'administrator'):
+            with self.subTest(case=case):
+                self.bot.members.remember(self.user)
+                self.api.members[2]={'status':'member','user':self.user}
+                self.api.calls.clear()
+                if case == 'renamed':self.api.members[2]['user']={'id':2,'username':'renamed'}
+                elif case == 'removed_username':
+                    self.bot.members.observe({'message':{'chat':{'id':-1},'from':{'id':2},'text':'hi'}})
+                elif case == 'administrator':self.api.members[2]['status']='administrator'
+                target='@unknown' if case == 'unknown' else '@Alice'
+                self.command('/ban '+target)
+                self.assertFalse(any(m=='banChatMember' for m,d in self.api.calls))
+                if case in ('renamed','removed_username'):
+                    with self.assertRaises(ValueError):self.bot.members.resolve('@Alice')
     def test_unknown_and_lookup_failure_do_not_ban(self):
         self.command('/ban @unknown')
         self.api.failure='getChatMember'
@@ -32,10 +43,3 @@ class Tests(unittest.TestCase):
         self.command('/mute @Alice 30')
         self.assertTrue(any(m=='restrictChatMember' and d['user_id']==2 for m,d in self.api.calls))
         self.assertIn('30 分钟',self.api.calls[-1][1]['text'])
-    def test_current_observations_clear_removed_username(self):
-        self.bot.members.observe({'message':{'chat':{'id':-1},'from':{'id':2},'text':'hi'}})
-        with self.assertRaises(ValueError):self.bot.members.resolve('@Alice')
-    def test_admin_protection(self):
-        self.api.members[2]['status']='administrator'
-        self.command('/ban @Alice')
-        self.assertFalse(any(m=='banChatMember' for m,d in self.api.calls))

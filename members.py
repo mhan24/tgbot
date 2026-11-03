@@ -7,10 +7,14 @@ class Members:
         self.bot=bot;self.db=bot.db
         self.db.execute('CREATE TABLE IF NOT EXISTS member_names(uid INTEGER PRIMARY KEY,username TEXT,at INTEGER)')
         self.db.execute('CREATE INDEX IF NOT EXISTS member_names_username ON member_names(username)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS known_bots(uid INTEGER PRIMARY KEY,name TEXT,username TEXT,inviter INTEGER,approved INTEGER DEFAULT 0)')
         self.db.commit()
 
     def remember(self,user):
         if not isinstance(user,dict) or not isinstance(user.get('id'),int) or user['id']<=0:return
+        if user.get('is_bot'):
+            with self.db:
+                self.db.execute('INSERT INTO known_bots(uid,name,username) VALUES(?,?,?) ON CONFLICT(uid) DO UPDATE SET name=excluded.name,username=excluded.username',(user['id'],user.get('first_name') or str(user['id']),user.get('username') or ''))
         name=(user.get('username') or '').lower()
         with self.db:
             if name:self.db.execute('UPDATE member_names SET username=? WHERE username=? AND uid!=?',('',name,user['id']))

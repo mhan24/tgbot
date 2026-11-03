@@ -20,19 +20,19 @@ class Tests(unittest.TestCase):
             self.assertEqual(self.client.lookup('45717360')['scheme'],'visa')
             self.assertEqual(req.call_count,1)
             self.assertEqual(req.call_args[0][0].get_header('Accept-version'),'3')
-    def test_not_found(self):
-        with patch('binlookup.urllib.request.urlopen',side_effect=urllib.error.HTTPError('url',404,'',{},None)):
-            with self.assertRaisesRegex(LookupError,'未找到'): self.client.lookup('45717360')
+    def test_upstream_failures_return_no_result(self):
+        cases = ({'side_effect': urllib.error.HTTPError('url',404,'',{},None)},
+                 {'side_effect': TimeoutError}, {'return_value': io.BytesIO(b'not json')})
+        for response in cases:
+            with self.subTest(response=response), patch('binlookup.urllib.request.urlopen', **response):
+                with self.assertRaises(LookupError) as error:self.client.lookup('45717360')
+                if isinstance(response.get('side_effect'), urllib.error.HTTPError):
+                    self.assertIn('未找到', str(error.exception))
     def test_rate_limit_backoff(self):
         with patch('binlookup.urllib.request.urlopen',side_effect=urllib.error.HTTPError('url',429,'',{'Retry-After':'120'},None)) as req:
             for _ in range(2):
                 with self.assertRaises(LookupError): self.client.lookup('45717360')
             self.assertEqual(req.call_count,1)
-    def test_timeout_and_malformed(self):
-        with patch('binlookup.urllib.request.urlopen',side_effect=TimeoutError):
-            with self.assertRaises(LookupError): self.client.lookup('45717360')
-        with patch('binlookup.urllib.request.urlopen',return_value=io.BytesIO(b'not json')):
-            with self.assertRaises(LookupError): self.client.lookup('45717360')
     def test_null_boolean_and_escape(self):
         text=format_result('45717360',{'bank':{'name':'<test>'},'country':None,'prepaid':False,'number':{'luhn':None}})
         self.assertIn('&lt;test&gt;',text);self.assertIn('预付卡：否',text);self.assertIn('Luhn 校验：未知',text)

@@ -7,7 +7,7 @@ from concurrent.futures import Future
 from unittest.mock import patch
 
 from bot import Bot
-from jev_ads import JevAds, JevError, classify
+from jev_ads import JevAds, JevError, classify, classify_sender
 from test_bot import FakeAPI
 
 
@@ -198,7 +198,7 @@ class JevTests(unittest.TestCase):
     def test_caption_and_embedded_link_submitted(self):
         target = {'message_id':101,'from':{'id':2},'caption':'点这里购买','caption_entities':[{'type':'text_link','url':'https://example.test'}]}
         self.report(target=target); self.guard.work()
-        self.assertEqual(self.pool.calls[0][1:], ('点这里购买', ['https://example.test']))
+        self.assertEqual(self.pool.calls[0][1:3], ('点这里购买', ['https://example.test']))
 
     def test_deprecated_commands_are_absent_from_help(self):
         self.bot.help_command({'chat':{'id':-1},'message_id':201,'from':{'id':1},'text':'/help'})
@@ -218,3 +218,27 @@ class JevTests(unittest.TestCase):
         valid['answers']['advertising']['probabilities']['ad'] = True
         with patch('jev_ads.urllib.request.urlopen',return_value=io.BytesIO(json.dumps(valid).encode())):
             with self.assertRaises(JevError): classify(self.bot.cfg,'hello',[])
+
+    def test_profile_fetch_and_unavailable_fallback(self):
+        profile={'username':'example','first_name':'Example'}
+        with patch.object(self.api,'call',return_value={'id':2,'bio':'联系购买','username':'shop'}), patch('jev_ads.classify',return_value=(True,.9,'test')) as model:
+            result=classify_sender(self.bot.cfg,'hello',[],profile,self.api,2)
+            self.assertEqual(model.call_args.args[3]['bio'],'联系购买')
+            self.assertEqual(result[3]['username'],'shop')
+        with patch.object(self.api,'call',side_effect=RuntimeError()), patch('jev_ads.classify',return_value=(False,.1,'test')):
+            result=classify_sender(self.bot.cfg,'hello',[],profile,self.api,2)
+            self.assertEqual(result[3]['bio_status'],'unavailable')
+            self.assertEqual(result[3]['first_name'],'Example')
+    def test_profile_seed_persists_and_html_is_escaped(self):
+        self.report(target=dict(self.target,**{'from':{'id':2,'first_name':'<name>','username':'example'}}))
+        self.assertEqual(json.loads(self.row()['profile'])['username'],'example')
+        self.assertIn('&lt;name&gt;',self.guard.card_text(self.row()))
+        other=JevAds(self.bot);other.pool.shutdown()
+        self.assertEqual(json.loads(self.row()['profile'])['username'],'example')
+
+    def test_subq_key_does_not_enable_dual_advertising_calls(self):
+        cfg=dict(self.bot.cfg,SUBQ_API_KEY='fake')
+        with patch('jev_ads.classify',return_value=(False,.2,'jev-test')) as model:
+            result=classify_sender(cfg,'hello',[],{},self.api,2)
+            self.assertEqual(model.call_count,1)
+            self.assertEqual(len(result),4)

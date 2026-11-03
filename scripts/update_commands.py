@@ -4,7 +4,6 @@ Run on the production host: python3 /opt/tgbot/scripts/update_commands.py
 Command handlers remain responsible for checking permissions.
 """
 import json
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -28,10 +27,9 @@ def main():
                     raise
                 time.sleep(attempt + 1)
 
-    db = sqlite3.connect('/var/lib/tgbot/bot.sqlite3')
     scopes = [{'type': name} for name in
               ('default', 'all_private_chats', 'all_group_chats', 'all_chat_administrators')]
-    for (gid,) in db.execute('SELECT chat FROM managed_groups'):
+    for gid in (int(config(str(BASE / '.env')).get('GROUP_ID', -1003014905211)),):
         scopes.extend([{'type': 'chat', 'chat_id': gid},
                        {'type': 'chat_administrators', 'chat_id': gid}])
         for member in call('getChatAdministrators', chat_id=gid):
@@ -45,11 +43,11 @@ def main():
             # Preserve empty scopes so Telegram continues to inherit its fallback menu.
             new = [{'command': c['command'], 'description': descriptions[c['command']]}
                    for c in old if c['command'] in descriptions]
-            retired = {'warn', 'warnings', 'resetwarn', 'mute', 'unmute', 'ban', 'unban', 'white', 'unwhite', 'whitelist'}
-            if any(c['command'] in retired for c in old) and not any(c['command'] == 'manage' for c in new):
-                new.append({'command': 'manage', 'description': descriptions['manage']})
-            if old and not any(c['command'] == 'rate' for c in new):
-                new.append({'command': 'rate', 'description': descriptions['rate']})
+            if old:
+                existing = {c['command'] for c in new}
+                new.extend({'command': name, 'description': descriptions[name]}
+                           for name in ('rate', 'invite')
+                           if name not in existing)
             checked += 1
             if new != old:
                 call('setMyCommands', commands=new, **kwargs)

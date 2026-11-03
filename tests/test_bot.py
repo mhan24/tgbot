@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 from bot import Bot, APIError
 
-
 class FakeAPI:
     def __init__(self):
         self.calls = []
@@ -37,9 +36,10 @@ class FakeAPI:
                 return {'status': 'member' if self.subscribed else 'left'}
             return {'status': 'administrator' if data['user_id'] == 1 else 'member'}
         if method == 'getChat':
+            if isinstance(data.get('chat_id'), int) and data['chat_id'] > 0:
+                return {'id': data['chat_id'], 'type': 'private'}
             return {'permissions': {'can_send_messages': True, 'can_send_photos': True, 'can_invite_users': False}}
         return True
-
 
 class Tests(unittest.TestCase):
     def setUp(self):
@@ -47,6 +47,7 @@ class Tests(unittest.TestCase):
         self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, sqlite3.connect(':memory:'))
         self.bot.bot_id = 99
         self.bot.username = 'testbot'
+        self.addCleanup(self.bot.db.close)
 
     def verify(self):
         self.bot.start_verification({'id': 2, 'is_bot': False}, 'request', 2)
@@ -80,7 +81,7 @@ class Tests(unittest.TestCase):
         self.bot.expire()
         self.assertTrue(any(m == 'declineChatJoinRequest' for m, _ in self.api.calls))
 
-    def test_only_third_warning_mutes_and_deduplicates(self):
+    def test_third_warning_bans_blacklists_and_deduplicates(self):
         for i in range(2):
             self.bot.warn(2, str(i), 'test')
         self.assertFalse(any(m == 'restrictChatMember' for m, _ in self.api.calls))
@@ -89,6 +90,10 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.bot.db.execute('SELECT count FROM warnings').fetchone()[0], 3)
         self.assertEqual(sum(m == 'restrictChatMember' for m, _ in self.api.calls), 0)
         self.assertEqual(sum(m == 'banChatMember' for m, _ in self.api.calls), 1)
+        self.assertTrue(self.bot.blacklisted(2))
+        self.assertFalse(self.bot.blacklisted(3))
+        self.assertTrue(next(d['revoke_messages'] for m,d in self.api.calls if m == 'banChatMember'))
+        self.assertEqual(self.bot.points.stats(2)[0], 0)
 
     def test_warning_failure_retry_does_not_double_count(self):
         self.api.failure = 'sendMessage'
@@ -142,13 +147,6 @@ class Tests(unittest.TestCase):
         for i in range(3):
             self.bot.handle({'update_id': 30+i, 'message': {'chat': {'id': -1}, 'message_id': 30+i, 'from': {'id': 777000}, 'sender_chat': {'id': -55}, 'text': '日赚1000，私聊我'}})
         self.assertEqual(sum(m == 'banChatSenderChat' for m, _ in self.api.calls), 0)
-
-    def test_third_warning_kicks_and_blacklists(self):
-        for i in range(3):
-            self.bot.warn(2, str(i), 'test')
-        self.assertEqual([d['user_id'] for m, d in self.api.calls if m == 'banChatMember'], [2])
-        self.assertTrue(self.bot.blacklisted(2))
-        self.assertFalse(self.bot.blacklisted(3))
 
     def test_ban_command_removes_and_blacklists(self):
         msg = {'chat': {'id': -1}, 'text': '/ban 广告', 'from': {'id': 1},
@@ -237,35 +235,19 @@ class Tests(unittest.TestCase):
         self.assertEqual(deleted, [1])
         self.assertEqual([r['message_id'] for r in self.bot.db.execute('SELECT message_id FROM deletions')], [99])
 
-    def test_other_bot_group_message_is_queued(self):
-        self.bot.handle({'update_id': 1, 'message': {
-            'chat': {'id': self.bot.group, 'type': 'supergroup'}, 'message_id': 77,
-            'from': {'id': 500, 'is_bot': True, 'first_name': 'Other'}, 'text': 'bot says hi'}})
-        self.assertEqual([r['message_id'] for r in self.bot.db.execute('SELECT message_id FROM deletions')], [77])
-
-    def test_channel_identity_posts_are_never_queued_for_deletion(self):
-        # Telegram may provide a bot-like from field for channel identity posts.
-        for cid in (self.bot.group, self.bot.channel, -999999):
-            with self.bot.db:
-                self.bot.db.execute('DELETE FROM deletions')
-            self.bot.handle({'update_id': cid & 0xffff, 'message': {
-                'chat': {'id': self.bot.group, 'type': 'supergroup'}, 'message_id': abs(cid) % 1000 + 1,
-                'sender_chat': {'id': cid, 'type': 'channel', 'title': 'Channel'},
-                'from': {'id': cid, 'is_bot': True, 'first_name': 'Channel'},
-                'text': '频道身份的普通内容'}})
-            self.assertEqual(self.bot.db.execute('SELECT count(*) FROM deletions').fetchone()[0], 0, cid)
-
-    def test_real_bot_message_still_queued_with_sender_chat_absent(self):
-        self.bot.handle({'update_id': 1, 'message': {
-            'chat': {'id': self.bot.group, 'type': 'supergroup'}, 'message_id': 42,
-            'from': {'id': 555, 'is_bot': True, 'first_name': 'OtherBot'}, 'text': 'bot'}})
-        self.assertEqual([r['message_id'] for r in self.bot.db.execute('SELECT message_id FROM deletions')], [42])
-
-    def test_human_group_message_is_not_queued(self):
-        self.bot.handle({'update_id': 1, 'message': {
-            'chat': {'id': self.bot.group, 'type': 'supergroup'}, 'message_id': 78,
-            'from': {'id': 2, 'is_bot': False, 'first_name': 'Human'}, 'text': 'hello'}})
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM deletions').fetchone()[0], 0)
+    def test_observed_message_cleanup_respects_sender_identity(self):
+        cases = [({'from': {'id':500, 'is_bot':True}}, True),
+                 ({'from': {'id':2, 'is_bot':False}}, False)]
+        cases += [({'sender_chat': {'id':cid, 'type':'channel'},
+                    'from': {'id':cid, 'is_bot':True}}, False)
+                  for cid in (self.bot.group, self.bot.channel, -999999)]
+        for mid, (sender, queued) in enumerate(cases, 77):
+            with self.subTest(sender=sender):
+                self.bot.handle({'update_id':mid, 'message':{
+                    'chat':{'id':self.bot.group, 'type':'supergroup'},
+                    'message_id':mid, 'text':'hello', **sender}})
+                ids = {r['message_id'] for r in self.bot.db.execute('SELECT message_id FROM deletions')}
+                self.assertEqual(mid in ids, queued)
 
     def test_undeletable_message_is_dropped(self):
         self.bot.schedule_delete(self.bot.group, 7)
@@ -302,9 +284,10 @@ class Tests(unittest.TestCase):
         self.assertIn('仅管理员', text)
         self.assertNotIn('/menu', text)
         self.assertNotIn('/cleaninactive', text)
-        for removed in ('原神启动', '/blockedwords', '/flagged', '/unflag'):
+        for removed in ('/airdrop', '/airdrops', '空投', '原神启动', '/blockedwords', '/flagged', '/unflag',
+                        '/ai', '/treasure', '/treasures', '/keyword', '/keywords', 'AI 问答', '限时夺宝', '关键词积分'):
             self.assertNotIn(removed, text)
-        for token in ('/checkin', '/points', '/rank', '/bin', '/ai', '/manage', '/airdrop', '/status'):
+        for token in ('/checkin', '/points', '/rank', '/bin', '/manage', '/status'):
             self.assertIn(token, text)
         self.assertEqual(self.api.calls[-1][1]['parse_mode'], 'HTML')
 
@@ -315,6 +298,8 @@ class Tests(unittest.TestCase):
     def test_help_is_counted_as_a_group_operation(self):
         self.assertTrue(self.bot.is_bot_operation({'text': '/help'}))
         self.assertTrue(self.bot.is_bot_operation({'text': '/help@testbot'}))
+        for retired in ('/keyword', '/treasure', '/ai'):
+            self.assertFalse(self.bot.is_bot_operation({'text': retired}))
         self.assertFalse(self.bot.is_bot_operation({'text': '/menu'}))
 
     def test_removed_admin_commands_are_not_registered(self):
@@ -322,28 +307,13 @@ class Tests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(self.bot.command({'text': command, 'from': {'id': 1}}, 1))
 
-
-
 if __name__ == '__main__':
     unittest.main()
 
-
-class BanPurgeTests(unittest.TestCase):
-    def test_purge_parameter_and_context_only_after_success(self):
+class BanRevokeTests(unittest.TestCase):
+    def test_ban_requests_telegram_message_revocation(self):
         api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,sqlite3.connect(':memory:'))
-        bot.history.record({'chat':{'id':-1},'message_id':42,'from':{'id':2},'text':'history'})
-        bot.history.record({'chat':{'id':-1},'message_id':43,'from':{'id':3},'text':'keep'})
-        api.failure='banChatMember'
-        with self.assertRaises(APIError):bot.blacklist_member(2)
-        self.assertEqual(bot.db.execute('SELECT count(*) FROM chat_history').fetchone()[0],2)
-        api.failure=None;bot.blacklist_member(2)
+        bot.blacklist_member(2)
         bans=[d for m,d in api.calls if m=='banChatMember']
+        self.assertTrue(bans)
         self.assertTrue(all(d['revoke_messages'] is True for d in bans))
-        self.assertEqual([r['uid'] for r in bot.db.execute('SELECT uid FROM chat_history')],[3])
-
-    def test_warning_ban_revokes_messages(self):
-        api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,sqlite3.connect(':memory:'))
-        for i in range(3):bot.warn(2,str(i),'spam')
-        bans=[d for m,d in api.calls if m=='banChatMember']
-        self.assertEqual(len(bans),1)
-        self.assertTrue(bans[0]['revoke_messages'])

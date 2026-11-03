@@ -40,7 +40,6 @@ class GroupSettingsTests(unittest.TestCase):
         self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2',
                         'TELEGRAM_CHANNEL': '@mainchannel'}, self.api, self.db)
         self.bot.bot_id = 99
-        self.bot._init_group_manager()
 
     def message(self, uid, text, reply_id=None):
         msg = {'chat': {'id': uid, 'type': 'private'}, 'from': {'id': uid}, 'text': text}
@@ -76,57 +75,57 @@ class GroupSettingsTests(unittest.TestCase):
         self.assertFalse(self.api.calls[-1][1].get('show_alert'))
         return self.api.sent
 
-    def test_settings_command_opens_button_panel_and_owner_changes_range_by_reply(self):
-        prompt_id = self.begin_edit('CHECKIN_RANGE')
-        self.assertTrue(self.bot.group_settings_reply(self.message(1, '5-10')))
-        self.assertEqual((self.bot.checkin_min, self.bot.checkin_max), (5, 10))
-        self.assertEqual(self.db.execute('SELECT value FROM group_settings WHERE key="CHECKIN_MIN"').fetchone()[0], '5')
-        self.assertEqual(self.db.execute('SELECT value FROM group_settings WHERE key="CHECKIN_MAX"').fetchone()[0], '10')
+    def test_settings_command_opens_button_panel_and_owner_changes_int_by_reply(self):
+        prompt_id = self.begin_edit('MESSAGE_POINTS')
+        self.assertTrue(self.bot.group_settings_reply(self.message(1, '3')))
+        self.assertEqual(self.bot.message_points, 3)
+        self.assertEqual(self.db.execute('SELECT value FROM group_settings WHERE key="MESSAGE_POINTS"').fetchone()[0], '3')
 
         reloaded = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, self.db)
-        self.assertEqual((reloaded.points.checkin_min, reloaded.points.checkin_max), (5, 10))
+        self.assertEqual(reloaded.points.message_points, 3)
 
     def test_cancel_and_commands_do_not_save_values(self):
-        self.begin_edit('CHECKIN_RANGE')
+        self.begin_edit('MESSAGE_POINTS')
         self.bot.group_settings_reply(self.message(1, '/help'))
-        self.assertEqual(self.bot.checkin_min, 1)
+        self.assertEqual(self.bot.message_points, 1)
         self.assertTrue(self.bot.group_settings_reply(self.message(1, '/cancel')))
-        self.assertFalse(self.bot.group_settings_reply(self.message(1, '5-10')))
-        self.assertEqual(self.bot.checkin_min, 1)
+        self.assertFalse(self.bot.group_settings_reply(self.message(1, '3')))
+        self.assertEqual(self.bot.message_points, 1)
 
     def test_model_setting_removed_and_old_button_rejected(self):
-        self.assertNotIn('AI_MODEL', self.bot.GROUP_SETTING_SPECS)
+        for key in ('AI_MODEL', 'CHECKIN_MIN', 'CHECKIN_MAX', 'AI_ENABLED', 'AI_COOLDOWN_SECONDS',
+                    'HISTORY_MESSAGES', 'HISTORY_CONTEXT'):
+            self.assertNotIn(key, self.bot.GROUP_SETTING_SPECS)
         self.click('gs:e:-1:1:AI_MODEL')
+        self.click('gs:t:-1:1:AI_ENABLED')
         self.assertIsNone(self.db.execute('SELECT * FROM group_setting_sessions').fetchone())
 
     def test_only_creator_can_open_or_use_settings_buttons(self):
         self.bot.group_settings_command(self.message(2, '/settings'))
-        self.assertIn('只有已登记管理群的群主', self.api.calls[-1][1]['text'])
-        data = self.panel_button('CHECKIN_RANGE')
+        self.assertIn('只有本群群主', self.api.calls[-1][1]['text'])
+        data = self.panel_button('MESSAGE_POINTS')
         before = len(self.api.calls)
         self.click(data, uid=2)
         self.assertFalse(any(method == 'sendMessage' and data.get('reply_markup', {}).get('force_reply')
                              for method, data in self.api.calls[before:]))
 
-    def test_invalid_value_prompts_again_and_range_can_reset(self):
-        prompt_id = self.begin_edit('CHECKIN_RANGE')
-        self.bot.group_settings_reply(self.message(1, '12-5', prompt_id))
-        self.assertEqual((self.bot.checkin_min, self.bot.checkin_max), (1, 5))
-        self.bot.group_settings_reply(self.message(1, '5-10', self.api.sent))
-        self.assertEqual((self.bot.checkin_min, self.bot.checkin_max), (5, 10))
+    def test_invalid_value_prompts_again_and_int_can_reset(self):
+        prompt_id = self.begin_edit('MESSAGE_POINTS')
+        self.bot.group_settings_reply(self.message(1, '0', prompt_id))
+        self.assertEqual(self.bot.message_points, 1)
+        self.bot.group_settings_reply(self.message(1, '3', self.api.sent))
+        self.assertEqual(self.bot.message_points, 3)
 
-        data = self.panel_button('CHECKIN_RANGE', action='r')
+        data = self.panel_button('MESSAGE_POINTS', action='r')
         panel = next(data for method, data in reversed(self.api.calls)
                      if method == 'sendMessage' and 'reply_markup' in data)
         panel = dict(panel, message_id=self.api.sent)
         self.click(data, message_id=panel['message_id'])
-        self.assertEqual((self.bot.checkin_min, self.bot.checkin_max), (1, 5))
+        self.assertEqual(self.bot.message_points, 1)
 
     def test_group_channel_id_and_verification_link_are_group_specific(self):
         prompt_id = self.begin_edit('CHANNEL_ID')
         self.bot.group_settings_reply(self.message(1, '@secondchannel', prompt_id))
-        row = self.db.execute('SELECT channel,channel_url FROM managed_groups WHERE chat=-1').fetchone()
-        self.assertEqual((row['channel'], row['channel_url']), (-20, 'https://t.me/secondchannel'))
         self.assertEqual((self.bot.channel, self.bot.channel_url), (-20, 'https://t.me/secondchannel'))
 
         prompt_id = self.begin_edit('CHANNEL_URL')
@@ -136,25 +135,8 @@ class GroupSettingsTests(unittest.TestCase):
         reloaded = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2',
                         'TELEGRAM_CHANNEL': '@mainchannel'}, self.api, self.db)
         reloaded.bot_id = 99
-        reloaded._init_group_manager()
         self.assertEqual((reloaded.channel, reloaded.channel_url),
                          (-20, 'https://t.me/private_invite'))
-
-    def test_tenant_channel_link_does_not_leak_to_other_group(self):
-        other_db = sqlite3.connect(':memory:')
-        other = Bot({'GROUP_ID': '-2', 'CHANNEL_ID': '-3',
-                     'TELEGRAM_CHANNEL_URL': 'https://t.me/secondchannel'}, self.api, other_db)
-        other.manager_root = self.bot
-        self.bot.managed_bots[-2] = other
-        with self.db:
-            self.db.execute('INSERT INTO managed_groups(chat,channel,title,db_path,enabled,channel_url) '
-                            'VALUES(-2,-3,?,?,1,?)',
-                            ('Second group', '/tmp/second.sqlite3', 'https://t.me/secondchannel'))
-
-        other.start_verification({'id': 2, 'is_bot': False}, 'request', 2)
-        self.assertIn({'text': '① 关注频道', 'url': 'https://t.me/secondchannel'},
-                      self.api.calls[-1][1]['reply_markup']['inline_keyboard'][0])
-        self.assertEqual(self.bot.channel_url, 'https://t.me/mainchannel')
 
     def test_channel_link_rejects_non_telegram_or_http_urls(self):
         for value in ('http://t.me/channel', 'https://evil.example/channel',

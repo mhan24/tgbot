@@ -10,11 +10,11 @@ from points import CST
 class Tests(unittest.TestCase):
     def setUp(self):
         self.api = FakeAPI()
-        self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2', 'AI_BASE_URL': 'https://x.test/v1',
-                        'AI_API_KEY': 'k', 'AI_MODEL': 'm'}, self.api, sqlite3.connect(':memory:'))
+        self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, sqlite3.connect(':memory:'))
         self.bot.bot_id, self.bot.username = 99, 'testbot'
         self.bot.can_manage_tags = True
         self.group = self.bot.group
+        self.addCleanup(self.bot.db.close)
 
     def msg(self, mid, text, uid=2):
         return {'chat': {'id': self.group, 'type': 'supergroup'}, 'message_id': mid,
@@ -29,12 +29,6 @@ class Tests(unittest.TestCase):
         self.white()
         self.bot.jev.submit_target(self.msg(2, '日赚1000，私聊我'))
         self.assertIsNone(self.bot.db.execute('SELECT 1 FROM jev_cases').fetchone())
-
-    def test_whitelisted_member_skips_daily_group_limit(self):
-        self.white()
-        for i in range(1, 8):
-            self.bot.handle({'update_id': i, 'message': self.msg(i, '/rank')})
-        self.assertIsNone(self.bot.db.execute("SELECT 1 FROM sqlite_master WHERE name='command_usage'").fetchone())
 
     def test_whitelisted_member_is_exempt_from_three_day_blacklist(self):
         self.white()
@@ -58,14 +52,12 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.bot.whitelisted(2))
         self.assertIn('黑名单优先', self.api.calls[-1][1]['text'])
 
-    def test_remove_from_whitelist_restores_limits(self):
+    def test_remove_from_whitelist_restores_membership_rules(self):
         self.white()
         self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/unwhite 2',
                           'from': {'id': 1}, 'message_id': 2}, 2)
         self.assertFalse(self.bot.whitelisted(2))
-        for i in range(1, 5):
-            self.bot.handle({'update_id': i, 'message': self.msg(i, '/rank')})
-        self.assertIsNone(self.bot.db.execute("SELECT 1 FROM sqlite_master WHERE name='command_usage'").fetchone())
+        self.assertFalse(self.bot.exempt(2))
 
     def test_manage_lists_whitelist_entries(self):
         self.white()
@@ -84,23 +76,6 @@ class Tests(unittest.TestCase):
         self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/white 2',
                           'from': {'id': 2}, 'message_id': 4}, 4)
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM whitelist').fetchone()[0], 0)
-
-    def test_ai_cooldown_and_verification_skipped(self):
-        self.white()
-        self.api.calls.clear()
-        with self.bot.db:
-            self.bot.db.execute("INSERT INTO verification(uid,kind) VALUES(2,'member')")
-            self.bot.db.execute('INSERT OR REPLACE INTO ai_cooldown VALUES(2,?)', (time.time(),))
-        self.bot.handle({'update_id': 1, 'message': self.msg(1, '/ai 你好')})
-        job = self.bot.db.execute('SELECT count(*) FROM ai_jobs').fetchone()[0]
-        self.assertEqual(job, 1)
-        self.assertFalse(any('请先完成入群验证' in str(d.get('text', '')) for m, d in self.api.calls if m == 'sendMessage'))
-
-    def test_ai_cooldown_still_applies_without_whitelist(self):
-        with self.bot.db:
-            self.bot.db.execute('INSERT OR REPLACE INTO ai_cooldown VALUES(2,?)', (time.time(),))
-        self.bot.handle({'update_id': 1, 'message': self.msg(1, '/ai 你好')})
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM ai_jobs').fetchone()[0], 0)
 
     def test_whitelisted_join_is_approved_without_challenge(self):
         self.white()
@@ -141,7 +116,6 @@ class Tests(unittest.TestCase):
         self.bot.attention.tick(force=True)
         self.assertFalse(self.bot.blacklisted(2))
         self.assertEqual(self.bot.points.stats(2)[0], 60)
-
 
 if __name__ == '__main__':
     unittest.main()

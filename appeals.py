@@ -14,13 +14,10 @@ class Appeals:
         CREATE TABLE IF NOT EXISTS appeals(
           id INTEGER PRIMARY KEY,uid INTEGER,reason TEXT,ban_at INTEGER,
           created INTEGER,state TEXT DEFAULT 'pending',notified INTEGER DEFAULT 0,
-          retry_at INTEGER DEFAULT 0,result_sent INTEGER DEFAULT 0);
+          retry_at INTEGER DEFAULT 0,result_sent INTEGER DEFAULT 0,
+          username TEXT NOT NULL DEFAULT '',display_name TEXT NOT NULL DEFAULT '');
         ''')
 
-        columns = {row[1] for row in self.db.execute('PRAGMA table_info(appeals)')}
-        for column in ('username', 'display_name'):
-            if column not in columns:
-                self.db.execute(f"ALTER TABLE appeals ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def applicant(self, row):
@@ -58,6 +55,7 @@ class Appeals:
         draft=self.db.execute('SELECT 1 FROM appeal_drafts WHERE uid=?',(uid,)).fetchone()
         if cmd=='/cancel' and draft:
             with self.db:self.db.execute('DELETE FROM appeal_drafts WHERE uid=?',(uid,))
+            self.bot.finish_private_steps(uid, 'appeal')
             self.bot.send(uid,'已取消填写。');return True
         if cmd not in ('/appeal','/start') and not (draft and not text.startswith('/')):return False
         ban=self.db.execute('SELECT * FROM blacklist WHERE uid=?',(uid,)).fetchone()
@@ -75,7 +73,9 @@ class Appeals:
         reason=text.split(maxsplit=1)[1] if cmd=='/appeal' and len(text.split(maxsplit=1))==2 else (text if draft and cmd!='/appeal' else '')
         if not reason:
             with self.db:self.db.execute('INSERT OR IGNORE INTO appeal_drafts VALUES(?)',(uid,))
-            self.bot.send(uid,'请发送解封理由（1–1000 字），发送 /cancel 取消。');return True
+            sent = self.bot.send(uid,'请发送解封理由（1–1000 字），发送 /cancel 取消。')
+            self.bot.track_private_step(uid, sent['message_id'], 'appeal', lifetime=None)
+            return True
         if len(reason)>1000:
             self.bot.send(uid,'理由请控制在 1000 字以内。');return True
         with self.db:
@@ -84,6 +84,7 @@ class Appeals:
             cur=self.db.execute('INSERT INTO appeals(uid,reason,ban_at,created,username,display_name) VALUES(?,?,?,?,?,?)',
                                 (uid,reason,ban['at'],int(time.time()),user.get('username') or '',name))
             self.db.execute('DELETE FROM appeal_drafts WHERE uid=?',(uid,))
+        self.bot.finish_private_steps(uid, 'appeal')
         self.bot.send(uid,f'解封申请 #{cur.lastrowid} 已保存，等待群主审核。批准后需重新申请入群并完成验证。')
         self.tick()
         return True

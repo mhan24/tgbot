@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram 群管：多群分发、验证、管理服务与持久化消息清理。仅使用标准库。"""
+"""Telegram 群管：单群验证、管理服务与持久化消息清理。仅使用标准库。"""
 from appeals import Appeals
 from milestones import Milestones
 import html
@@ -17,15 +17,14 @@ import urllib.parse
 import urllib.request
 
 from binlookup import BinLookup, LookupError, format_result
-from points import Points
-from airdrop import Airdrops
-from ai_chat import AIChat
+from points import Points, INVITE_DAILY_LIMIT, format_checkin
+from retention import notice_delay
 from attention import Attention
-from history import History
 from members import Members
 from jev_ads import JevAds
 from moderation import Moderation
 from exchange import Exchange, RateError
+from invitations import Invitations
 
 LOG = logging.getLogger('groupbot')
 # Chinese triggers remain usable for existing members, while Telegram's
@@ -76,9 +75,15 @@ class API:
             except Exception:
                 result = {'error_code': exc.code, 'description': 'HTTP error'}
         except (OSError, urllib.error.URLError):
-            raise APIError(method, {'description': 'Network failure'}) from None
+            raise APIError(method, {'error_code':503,'description': 'Network failure'}) from None
+        except (ValueError, UnicodeError):
+            raise APIError(method, {'error_code':503,'description':'Invalid API response'}) from None
+        if not isinstance(result, dict):
+            raise APIError(method, {'error_code':503,'description':'Invalid API response'})
         if not result.get('ok'):
             raise APIError(method, result)
+        if 'result' not in result:
+            raise APIError(method, {'error_code':503,'description':'Missing API result'})
         return result['result']
 
 
@@ -86,26 +91,21 @@ class API:
 
 class Bot:
     GROUP_SETTING_SPECS = {
-        'CHECKIN_MIN': {'type': 'int', 'min': 1, 'max': 1000, 'label': '签到积分下限'},
-        'CHECKIN_MAX': {'type': 'int', 'min': 1, 'max': 1000, 'label': '签到积分上限'},
         'MESSAGE_POINTS': {'type': 'int', 'min': 1, 'max': 100, 'label': '每条发言积分'},
         'MESSAGE_DAILY_LIMIT': {'type': 'int', 'min': 0, 'max': 1000, 'label': '每日发言积分上限'},
         'MUTE_SECONDS': {'type': 'int', 'min': 60, 'max': 2592000, 'label': '管理员默认禁言秒数'},
         'VERIFY_SECONDS': {'type': 'int', 'min': 30, 'max': 300, 'label': '入群验证秒数'},
         'DELETE_AFTER_SECONDS': {'type': 'int', 'min': 0, 'max': 3600, 'label': '群内机器人消息自动删除秒数'},
-        'HISTORY_MESSAGES': {'type': 'int', 'min': 0, 'max': 500, 'label': 'AI 历史记录保留条数'},
-        'HISTORY_CONTEXT': {'type': 'int', 'min': 0, 'max': 200, 'label': '每次 AI 引用历史条数'},
         'JEV_ENABLED': {'type': 'bool', 'label': 'Jev 手动广告举报'},
         'UPGRADE_POINTS': {'type': 'int', 'min': 1, 'max': 1000000, 'label': '成员标签/达标积分门槛'},
         'UPGRADE_TAG': {'type': 'tag', 'label': '达标后设置的成员标签'},
-        'AI_COOLDOWN_SECONDS': {'type': 'int', 'min': 0, 'max': 86400, 'label': '普通成员 AI 冷却秒数'},
     }
 
     def __init__(self, cfg, api=None, db=None):
-        self.base_cfg = dict(cfg)
         self.cfg = dict(cfg)
         self.api = api or API(cfg['TELEGRAM_BOT_TOKEN'])
-        self.group = int(cfg['GROUP_ID'])
+        self.group = int(cfg.get('GROUP_ID', -1003014905211))
+        self.group_title = str(cfg.get('GROUP_TITLE') or self.group)
         self.channel = int(cfg['CHANNEL_ID'])
         self.channel_url = self._configured_channel_url(cfg)
         self.mute_seconds = int(cfg.get('MUTE_SECONDS', 86400))
@@ -114,30 +114,20 @@ class Bot:
         self.upgrade_tag = cfg.get('UPGRADE_TAG', '家人')
         # Seconds before the bot removes its own group messages and other bots' group messages.
         self.delete_after = int(cfg.get('DELETE_AFTER_SECONDS', 30))
-        self.checkin_min = int(cfg.get('CHECKIN_MIN', 1))
-        self.checkin_max = int(cfg.get('CHECKIN_MAX', 5))
         self.message_points = int(cfg.get('MESSAGE_POINTS', 1))
         self.message_daily_limit = int(cfg.get('MESSAGE_DAILY_LIMIT', 5))
-        self.ai_cooldown_seconds = int(cfg.get('AI_COOLDOWN_SECONDS', 60))
         self.setting_defaults = {
-            'CHECKIN_MIN': self.checkin_min,
-            'CHECKIN_MAX': self.checkin_max,
             'MESSAGE_POINTS': self.message_points,
             'MESSAGE_DAILY_LIMIT': self.message_daily_limit,
             'MUTE_SECONDS': self.mute_seconds,
             'VERIFY_SECONDS': self.verify_seconds,
             'DELETE_AFTER_SECONDS': self.delete_after,
-            'HISTORY_MESSAGES': int(cfg.get('HISTORY_MESSAGES', 50)),
-            'HISTORY_CONTEXT': int(cfg.get('HISTORY_CONTEXT', 50)),
             'JEV_ENABLED': str(cfg.get('JEV_ENABLED', '1')).lower() in ('1', 'true', 'yes', 'on'),
             'UPGRADE_POINTS': self.upgrade_points,
             'UPGRADE_TAG': self.upgrade_tag,
-            'AI_COOLDOWN_SECONDS': self.ai_cooldown_seconds,
         }
         self.setting_defaults = {key: self.parse_group_setting(key, value)
                                  for key, value in self.setting_defaults.items()}
-        if self.setting_defaults['CHECKIN_MIN'] > self.setting_defaults['CHECKIN_MAX']:
-            raise ValueError('CHECKIN_MIN must not exceed CHECKIN_MAX')
         self.setting_values = dict(self.setting_defaults)
         self.setting_overrides = set()
         # Granted rights are unknown until run() reads them from the group membership.
@@ -156,21 +146,19 @@ class Bot:
         CREATE TABLE IF NOT EXISTS blacklist(uid INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,reason TEXT);
         CREATE TABLE IF NOT EXISTS upgrades(uid INTEGER PRIMARY KEY,tag TEXT,at INTEGER,total INTEGER);
         CREATE TABLE IF NOT EXISTS deletions(chat INTEGER,message_id INTEGER,attempts INTEGER DEFAULT 0,due INTEGER,PRIMARY KEY(chat,message_id));
+        CREATE TABLE IF NOT EXISTS private_steps(uid INTEGER,flow TEXT,message INTEGER,expires INTEGER,PRIMARY KEY(uid,flow,message));
         CREATE TABLE IF NOT EXISTS verification_prompts(chat INTEGER,message_id INTEGER,uid INTEGER,nonce TEXT,expires INTEGER,PRIMARY KEY(chat,message_id));
         CREATE TABLE IF NOT EXISTS whitelist(uid INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,note TEXT);
         CREATE TABLE IF NOT EXISTS user_activity(uid INTEGER PRIMARY KEY, last_active INTEGER);
         CREATE TABLE IF NOT EXISTS group_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS group_setting_sessions(
+          uid INTEGER PRIMARY KEY,group_id INTEGER NOT NULL,key TEXT NOT NULL,
+          prompt_message_id INTEGER NOT NULL,panel_message_id INTEGER NOT NULL,expires INTEGER NOT NULL);
         ''')
-        if 'punished' not in {row[1] for row in self.db.execute('PRAGMA table_info(violations)')}:
-            self.db.execute('ALTER TABLE violations ADD COLUMN punished INTEGER DEFAULT 0')
-            self.db.commit()
-        with self.db:
-            self.db.execute('DROP TABLE IF EXISTS command_usage')
-            self.db.execute('DROP TABLE IF EXISTS shop_notifications')
-            self.db.execute('DROP TABLE IF EXISTS shop_products')
-            self.db.execute("DELETE FROM meta WHERE key='shop_initialized'")
-            self.db.execute("DELETE FROM group_settings WHERE key='SHOP_NOTIFICATIONS'")
-            self.db.execute("DELETE FROM group_settings WHERE key='GROUP_COMMAND_LIMIT'")
+        for key, attribute in (('verification_channel', 'channel'), ('verification_channel_url', 'channel_url')):
+            row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+            if row:
+                setattr(self, attribute, int(row[0]) if attribute == 'channel' else row[0])
         for setting in self.db.execute('SELECT key,value FROM group_settings').fetchall():
             if setting['key'] not in self.GROUP_SETTING_SPECS:
                 continue
@@ -179,29 +167,17 @@ class Bot:
                 self.setting_overrides.add(setting['key'])
             except ValueError:
                 LOG.warning('Ignoring invalid stored group setting key=%s group=%s', setting['key'], self.group)
-        if self.setting_values['CHECKIN_MIN'] > self.setting_values['CHECKIN_MAX']:
-            LOG.warning('Ignoring invalid check-in range group=%s', self.group)
-            for key in ('CHECKIN_MIN', 'CHECKIN_MAX'):
-                self.setting_values[key] = self.setting_defaults[key]
-                self.setting_overrides.discard(key)
         self._apply_group_settings()
         self.bin_lookup = BinLookup(self.db)
         self.exchange = Exchange(self.db)
-        self.points = Points(self.db, self.checkin_min, self.checkin_max,
-                             self.message_points, self.message_daily_limit)
-        self.airdrops = Airdrops(self)
-        self.ai = AIChat(self)
+        self.points = Points(self.db, self.message_points, self.message_daily_limit)
+        self.invitations = Invitations(self)
         self.attention = Attention(self)
-        self.history = History(self, keep_messages=self.setting_values['HISTORY_MESSAGES'],
-                               context_messages=self.setting_values['HISTORY_CONTEXT'])
         self.members = Members(self)
         self.jev = JevAds(self)
         self.moderation = Moderation(self)
         self.appeals = Appeals(self)
         self.milestones = Milestones(self)
-        self.group_manager_root = False
-        self.managed_bots = {self.group: self}
-        self.manager_root = self
         self.username = ''
         self.bot_id = 0
 
@@ -256,8 +232,6 @@ class Bot:
         values = self.setting_values
         for key, value in values.items():
             self.cfg[key] = ('1' if value else '0') if isinstance(value, bool) else str(value)
-        self.checkin_min = values['CHECKIN_MIN']
-        self.checkin_max = values['CHECKIN_MAX']
         self.message_points = values['MESSAGE_POINTS']
         self.message_daily_limit = values['MESSAGE_DAILY_LIMIT']
         self.mute_seconds = values['MUTE_SECONDS']
@@ -265,15 +239,9 @@ class Bot:
         self.delete_after = values['DELETE_AFTER_SECONDS']
         self.upgrade_points = values['UPGRADE_POINTS']
         self.upgrade_tag = values['UPGRADE_TAG']
-        self.ai_cooldown_seconds = values['AI_COOLDOWN_SECONDS']
         if hasattr(self, 'points'):
-            self.points.checkin_min = self.checkin_min
-            self.points.checkin_max = self.checkin_max
             self.points.message_points = self.message_points
             self.points.message_daily_limit = self.message_daily_limit
-        if hasattr(self, 'history'):
-            self.history.keep_messages = values['HISTORY_MESSAGES']
-            self.history.context_messages = values['HISTORY_CONTEXT']
 
     def group_setting_value(self, key):
         value = self.setting_values[key]
@@ -284,24 +252,20 @@ class Bot:
     def call(self, method, **kwargs):
         keep = kwargs.pop('_keep', False)
         delete_after = kwargs.pop('_delete_after', None)
-        ai_history = kwargs.pop('_ai_history', False)
         if method == 'banChatMember':
             kwargs['revoke_messages'] = True
-        result = self.api.call(method, **kwargs)
+        try:
+            result = self.api.call(method, **kwargs)
+        except APIError as exc:
+            if method=='answerCallbackQuery' and exc.code==400 and any(term in exc.description.lower() for term in ('query is too old','query_id_invalid','query id is invalid')):
+                LOG.info('Callback acknowledgement expired; business state retained')
+                return False
+            raise
         if method == 'getChatMember' and isinstance(result, dict):
             self.members.remember(result.get('user'))
-        if method == 'banChatMember' and result:
-            with self.db:
-                self.db.execute('DELETE FROM chat_history WHERE chat=? AND uid=?',
-                                (kwargs['chat_id'], kwargs['user_id']))
         if method == 'sendMessage' and isinstance(result, dict):
-            # Normal replies use the group timer; AI replies supply their own delay.
             if delete_after is not None or not keep:
                 self.schedule_delete(kwargs.get('chat_id'), result.get('message_id'), seconds=delete_after)
-            # Keep our own group messages in the AI's view of the conversation.
-            self.history.record_outgoing(kwargs.get('chat_id'), result.get('message_id'), kwargs.get('text'),
-                                         reply_to_id=(kwargs.get('reply_parameters') or {}).get('message_id'),
-                                         topic_id=kwargs.get('message_thread_id') or result.get('message_thread_id'), ai=ai_history)
         return result
 
     def is_bot_operation(self, msg):
@@ -314,15 +278,29 @@ class Bot:
         if len(name) > 1 and name[1].lower() != self.username.lower():
             return False
         cmd = POINTS_COMMAND_ALIASES.get(name[0].lower(), name[0].lower())
-        return cmd in ('/help', '/checkin', '/points', '/rank', '/milestones', '/bin', '/rate', '/ai')
+        return cmd in ('/help', '/checkin', '/points', '/rank', '/milestones', '/bin', '/rate')
 
-    def schedule_delete(self, chat, message_id, seconds=None):
+    def schedule_delete(self, chat, message_id, seconds=None, allow_private=False):
         delay = self.delete_after if seconds is None else seconds
-        if delay <= 0 or chat is None or not message_id or chat != self.group:
+        if delay <= 0 or chat is None or not message_id or (chat != self.group and not (allow_private and isinstance(chat, int) and chat > 0)):
             return
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO deletions(chat,message_id,attempts,due) VALUES(?,?,0,?)',
                             (chat, int(message_id), int(time.time()) + delay))
+
+    def finish_private_steps(self, uid, flow):
+        # Only explicitly recorded bot prompts are eligible; user messages never enter this table.
+        rows = self.db.execute('SELECT message FROM private_steps WHERE uid=? AND flow=?', (uid,flow)).fetchall()
+        with self.db:
+            for row in rows:
+                self.schedule_delete(uid, row['message'], seconds=30, allow_private=True)
+            self.db.execute('DELETE FROM private_steps WHERE uid=? AND flow=?', (uid,flow))
+
+    def track_private_step(self, uid, message, flow, lifetime=3600, replace=True):
+        if replace:
+            self.finish_private_steps(uid, flow)
+        with self.db:
+            self.db.execute('INSERT INTO private_steps VALUES(?,?,?,?)', (uid,flow,message,int(time.time())+lifetime if lifetime is not None else None))
 
     def drop_deletion(self, row):
         with self.db:
@@ -340,6 +318,8 @@ class Bot:
 
     def sweep_deletions(self):
         self.queue_finished_verifications()
+        for prompt in self.db.execute('SELECT uid,flow FROM private_steps WHERE expires<=?', (int(time.time()),)).fetchall():
+            self.finish_private_steps(prompt['uid'], prompt['flow'])
         rows = self.db.execute('SELECT * FROM deletions WHERE due<=? ORDER BY due LIMIT 50',
                                (int(time.time()),)).fetchall()
         for row in rows:
@@ -375,7 +355,9 @@ class Bot:
                                 (row['chat'], row['message_id']))
 
     def send(self, chat, text, keep=False, **kwargs):
-        # keep=True exempts interactive messages whose buttons must outlive the auto-delete timer.
+        # Retain failures long enough to read; active cards and explicit overrides take precedence.
+        if chat == self.group and not keep and '_delete_after' not in kwargs:
+            kwargs['_delete_after'] = notice_delay(text, self.delete_after)
         return self.call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', _keep=keep, **kwargs)
 
     def audit(self, actor, target, action, detail=''):
@@ -549,7 +531,7 @@ class Bot:
             try:
                 self.call('declineChatJoinRequest', chat_id=self.group, user_id=uid)
             except APIError as exc:
-                if exc.code != 400 or not any(s in exc.description.lower() for s in ('hide_requester_missing', 'user_already_participant')):
+                if not ((exc.code==400 and any(s in exc.description.lower() for s in ('hide_requester_missing','user_already_participant','user_id_invalid'))) or (exc.code==403 and 'user is deactivated' in exc.description.lower())):
                     raise
         else:
             # Unban also removes current members; leave them free to request entry again.
@@ -636,20 +618,47 @@ class Bot:
                 self.db.execute('UPDATE violations SET punished=1 WHERE event=?', (event,))
         label = f'<a href="tg://user?id={uid}">该成员</a>' if uid > 0 else f'频道 {uid}'
         if not silent:
-            self.send(self.group, f'⚠️ {label} 警告 {count}/3：{html.escape(reason)}{suffix}')
+            self.send(self.group, f'⚠️ {label} 警告 {count}/3：{html.escape(reason)}{suffix}', _delete_after=120 if self.delete_after > 0 else 0)
         with self.db:
             self.db.execute('UPDATE violations SET done=1 WHERE event=?', (event,))
         self.audit(actor, uid, 'warn', reason)
 
-    def avatar_visible(self, uid):
+    def avatar_visible(self, uid, message_id=None, purpose='diagnostic'):
+        # Only bounded metadata is logged; photo/file IDs and response bodies stay private.
+        def record(result, reason, count=None, returned=None, api_code=None, chat_photo=None, chat_status='not_checked'):
+            LOG.info('Avatar check group=%s uid=%s purpose=%s message_id=%s total_count=%s returned=%s result=%s reason=%s api_code=%s chat_photo=%s chat_status=%s',
+                     self.group, uid, purpose, message_id, count, returned,
+                     'visible' if result is True else 'invisible' if result is False else 'unknown', reason, api_code, chat_photo, chat_status)
+            return result
         try:
-            photos = self.call('getUserProfilePhotos',user_id=uid,offset=0,limit=1)
-        except APIError:
-            LOG.warning('Avatar check unavailable uid=%s',uid)
-            return None
-        if not isinstance(photos,dict) or not isinstance(photos.get('total_count'),int) or not isinstance(photos.get('photos'),list):
-            return None
-        return photos['total_count']>0 and bool(photos['photos'])
+            photos = self.call('getUserProfilePhotos', user_id=uid, offset=0, limit=1)
+        except APIError as exc:
+            LOG.warning('Avatar check unavailable uid=%s', uid)
+            return record(None, 'api_error', api_code=exc.code if isinstance(exc.code, int) else None)
+        count = photos.get('total_count') if isinstance(photos, dict) else None
+        groups = photos.get('photos') if isinstance(photos, dict) else None
+        safe_count = count if type(count) is int and count >= 0 else None
+        returned = len(groups) if isinstance(groups, list) else None
+        if safe_count is None or returned is None:
+            return record(None, 'malformed_response', safe_count, returned)
+        if (count > 0) != bool(groups):
+            return record(None, 'inconsistent_response', safe_count, returned)
+        if count > 0:
+            return record(True, 'has_photo', safe_count, returned)
+        # The profile-photo list may be empty while the private chat exposes a photo.
+        try:
+            chat = self.call('getChat', chat_id=uid)
+        except APIError as exc:
+            return record(None, 'chat_lookup_error', safe_count, returned,
+                          api_code=exc.code if isinstance(exc.code, int) else None, chat_status='api_error')
+        if not isinstance(chat, dict) or chat.get('id') != uid or chat.get('type') != 'private':
+            return record(None, 'chat_malformed_response', safe_count, returned, chat_status='malformed')
+        photo = chat.get('photo')
+        if photo is None:
+            return record(False, 'empty_response', safe_count, returned, chat_photo=False, chat_status='ok')
+        if not isinstance(photo, dict) or not any(isinstance(photo.get(key), str) and photo[key] for key in ('small_file_id', 'big_file_id')):
+            return record(None, 'chat_malformed_photo', safe_count, returned, chat_status='malformed')
+        return record(True, 'chat_photo', safe_count, returned, chat_photo=True, chat_status='ok')
 
     def points_command(self, msg):
         text = msg.get('text', '').strip()
@@ -683,43 +692,62 @@ class Bot:
             self.send(self.group,'请先完成入群验证，再使用积分功能。')
             return True
         if cmd == '/checkin':
-            visible = self.avatar_visible(user['id'])
+            visible = self.avatar_visible(user['id'], message_id=msg.get('message_id'), purpose='checkin')
             if visible is not True:
                 if visible is False:
                     self.warn(user['id'],f'avatar_checkin:{self.group}:{msg["message_id"]}',
                               '头像不可见时发起签到，本次不加分。请设置头像并允许所有人查看后重试。')
+                else:
+                    self.send(self.group, '暂时无法核实头像，本次未加分、未计警告。请稍后重新发送 /checkin。',
+                              _delete_after=120 if self.delete_after > 0 else 0,
+                              reply_parameters={'message_id': msg['message_id'], 'allow_sending_without_reply': True})
                 return True
-            amount, status = self.points.award(user,'checkin',f'checkin:{self.group}:{msg["message_id"]}',msg.get('date'))
-            if status == 'added':
+            event = f'checkin:{self.group}:{msg["message_id"]}'
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                user, event, msg.get('date'))
+            if status in ('added', 'replay') and amount:
                 self.upgrade_member(user['id'])
-            total = self.points.stats(user['id'])[0]
-            text = f'✅ 签到成功，获得 {amount} 积分！' if status!='limit' else f'今天已经签到过了。北京时间零点后可再次签到。'
-        self.send(self.group,text,reply_parameters={'message_id':msg['message_id'],'allow_sending_without_reply':True})
+            if status == 'limit':
+                text = '今天已经签到过了。北京时间零点后可再次签到。'
+                self.send(self.group, text, reply_parameters={
+                    'message_id': msg['message_id'], 'allow_sending_without_reply': True})
+                return True
+            if not self.points.checkin_notified(event, 'result'):
+                self.send(self.group, format_checkin(amount, results, pity4, pity5, guaranteed),
+                          reply_parameters={'message_id': msg['message_id'],
+                                            'allow_sending_without_reply': True})
+                self.points.mark_checkin_notified(event, 'result')
+            if any(rarity in (5, 6) for rarity in results or []) and not self.points.checkin_notified(event, 'broadcast'):
+                self.send(self.group, self._checkin_broadcast(user, amount, results))
+                self.points.mark_checkin_notified(event, 'broadcast')
+            return True
         return True
+
+    def _checkin_broadcast(self, user, amount, results):
+        standard, up = results.count(5), results.count(6)
+        total = standard + up
+        name = ' '.join(str(user.get(k) or '') for k in ('first_name', 'last_name')).strip()
+        name = name or user.get('username') or str(user['id'])
+        mention = f'<a href="tg://user?id={user["id"]}">{html.escape(name)}</a>'
+        if total == 1:
+            tier = '五星 UP' if up else '五星常驻'
+            return f'🎉 {mention} 十连签到出现{tier}，获得 {amount} 积分！'
+        tier = '三黄' if total >= 3 else '双黄'
+        parts = []
+        if up:
+            parts.append(f'五星 UP ×{up}')
+        if standard:
+            parts.append(f'五星常驻 ×{standard}')
+        return f'🎉 {mention} 十连签到出现{tier}（{"、".join(parts)}），获得 {amount} 积分！'
 
     def private_ranking(self, msg, cmd):
         """Points details and full rankings are private-chat only."""
         chat = msg['chat']['id']
-        if cmd not in ('/rank','/points','/milestones'):
+        if cmd not in ('/checkin','/rank','/points','/milestones'):
             self.send(chat, '私聊支持积分、排行榜和达标榜：/points、/rank、/milestones。签到请在群内进行。')
             return True
         uid = msg['from']['id']
-        root = getattr(self, 'manager_root', self)
-        if root.group_manager_root and not msg.get('_selected_group'):
-            groups = root.db.execute('SELECT chat,title FROM managed_groups WHERE enabled=1 ORDER BY title COLLATE NOCASE,chat').fetchall()
-            if len(groups) > 1:
-                command_code = {'/points': 'p', '/rank': 'r', '/milestones': 'g'}[cmd]
-                buttons = [[{'text': f'{str(row["title"])[:34]} · {row["chat"]}',
-                             'callback_data': f'pg:{command_code}:{row["chat"]}:{uid}'}]
-                           for row in groups]
-                root.send(chat, '已启用多个管理群，请选择要查看的群组数据：',
-                          reply_markup={'inline_keyboard': buttons})
-                return True
-        group_title = str(self.group)
-        if root.group_manager_root:
-            title_row = root.db.execute('SELECT title FROM managed_groups WHERE chat=?', (self.group,)).fetchone()
-            if title_row:
-                group_title = title_row['title']
+        group_title = self.group_title
         safe_group_title = html.escape(group_title)
         try:
             member = self.call('getChatMember', chat_id=self.group, user_id=uid)
@@ -731,51 +759,18 @@ class Bot:
         if not active:
             self.send(chat, f'请先加入「{safe_group_title}」后再查询该群积分。')
             return True
+        if cmd == '/checkin':
+            self.send(chat, f'📍 群组：{safe_group_title}\n{self.points.checkin_summary(uid)}')
+            return True
         if cmd == '/points':
             total, checkin, messages, rank = self.points.stats(uid)
-            self.send(chat,f'📍 群组：{safe_group_title}\n⭐ 我的积分：{total}\n今日签到：{str(checkin)+" 分" if checkin else "未签到"}\n今日发言积分：{messages}/{self.message_daily_limit}\n总榜排名：{rank or "暂无"}')
+            self.send(chat,f'📍 群组：{safe_group_title}\n⭐ 我的积分：{total}\n今日签到：{str(checkin)+" 分" if checkin else "未签到"}\n今日发言积分：{messages}/{self.message_daily_limit}\n今日邀请积分：{self.points.invite_daily(uid)}/{INVITE_DAILY_LIMIT}\n总榜排名：{rank or "暂无"}')
             return True
         if cmd == '/milestones':
             self.send(chat, f'📍 群组：{safe_group_title}\n{self.milestones_ranking()}')
         else:
             text, markup = self.ranking_page(uid, 0)
             self.send(chat, text, reply_markup=markup)
-        return True
-
-    def private_group_callback(self, query):
-        """Route a private points/ranking query to the group chosen by the user."""
-        fields = query.get('data', '').split(':')
-        if len(fields) != 4 or fields[0] != 'pg':
-            return False
-        answer = lambda text='': self.call('answerCallbackQuery', callback_query_id=query['id'], text=text)
-        if not self.group_manager_root:
-            answer('群组选择已失效，请重新发送查询命令。')
-            return True
-        commands = {'p': '/points', 'r': '/rank', 'g': '/milestones'}
-        try:
-            cmd, gid, owner = commands[fields[1]], int(fields[2]), int(fields[3])
-        except (KeyError, ValueError):
-            answer('群组选择已失效，请重新发送查询命令。')
-            return True
-        message = query.get('message', {})
-        chat = message.get('chat', {})
-        if (query.get('from', {}).get('id') != owner or chat.get('type') != 'private'
-                or chat.get('id') != owner):
-            answer('请在自己的私聊中选择群组。')
-            return True
-        row = self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?', (gid,)).fetchone()
-        tenant = self.managed_bots.get(gid)
-        if not row or not row['enabled'] or tenant is None:
-            answer('该群组已停用，请重新发送查询命令。')
-            return True
-        answer()
-        try:
-            tenant.private_ranking({'chat': chat, 'from': query['from'], '_selected_group': True}, cmd)
-        finally:
-            try:
-                self.call('deleteMessage', chat_id=owner, message_id=message['message_id'])
-            except (APIError, KeyError):
-                pass
         return True
 
     def milestones_ranking(self):
@@ -792,12 +787,7 @@ class Bot:
 
     def ranking_page(self, uid, page):
         rows, total, page, pages = self.points.leaderboard_page(page)
-        group_title = str(self.group)
-        root = getattr(self, 'manager_root', self)
-        if root.group_manager_root:
-            title_row = root.db.execute('SELECT title FROM managed_groups WHERE chat=?', (self.group,)).fetchone()
-            if title_row:
-                group_title = title_row['title']
+        group_title = self.group_title
         lines = [f'🏆 {html.escape(group_title)} · 积分排行榜（全部 {total} 人）', f'第 {page + 1}/{pages} 页 · 每页 50 人']
         if not rows:
             lines.append('暂无积分记录，先在群里签到或发言吧。')
@@ -853,17 +843,6 @@ class Bot:
         return True
 
 
-    def ai_context(self, msg):
-        """Recent group messages before the trigger, so the AI can resolve references."""
-        try:
-            return self.history.recent(msg['chat']['id'], exclude_id=msg.get('message_id'),
-                                       limit=self.history.context_messages, conversation_only=True,
-                                       before_id=msg.get('message_id'),
-                                       topic_id=msg.get('message_thread_id') if msg.get('is_topic_message') else None)
-        except Exception:
-            LOG.warning('History lookup failed chat=%s', msg.get('chat', {}).get('id'))
-            return ''
-
     def rate_command(self, msg):
         parts = msg.get('text', '').split()
         if not parts:
@@ -911,26 +890,21 @@ class Bot:
             return True
         chat = msg['chat']['id']
         verify_time = f'{self.verify_seconds // 60} 分钟' if self.verify_seconds >= 60 else f'{self.verify_seconds} 秒'
-        ai_cooldown = f'普通成员每 {self.ai_cooldown_seconds} 秒一次' if self.ai_cooldown_seconds else '普通成员不限频'
         everyone = ('<b>全员可用</b>\n'
-                    f'• /checkin — 每日一次，随机 {self.checkin_min}–{self.checkin_max} 分；要求头像对机器人可见，未公开会提示并计警告\n'
+                    '• /checkin — 私聊查询出金及保底；群内每日一次十连，逐抽计分后相加：三星 0、四星 1、五星常驻 5、五星 UP 10；单次最多 3 个四/五星；四星 10 抽、五星 90 抽保底跨天累计；出五星时群内播报（双黄/三黄）；要求头像对机器人可见，未公开会提示并计警告\n'
                     f'• 发言积分：每次 {self.message_points} 分，每天最多 {self.message_daily_limit} 分；头像不可见时静默不计分\n'
-                    '• /points — 私聊查看余额、今日积分与排名；多群时先选择群组\n'
+                    f'• /invite — 私聊领取专属邀请链接；成功邀请每人 1 分，每天最多 {INVITE_DAILY_LIMIT} 分；同一成员仅计一次\n'
+                    '• /points — 私聊查看余额、今日积分与排名\n'
                     '• /report — 回复本群消息，提交 Jev 广告判断；1 名管理员或 5 名群员同意后警告一次\n'
-                    '• /rank — 私聊查看排行榜，每页 50 人，按钮翻页，不艾特榜单成员；多群时先选择群组\n'
-                    f'• 达标榜：/milestones — 首次达到 {self.upgrade_points} 分的前 50 位，不要求特定标签；多群时先选择群组\n'
-                    '• 多群管理：群主在新群发送 /group_add 登记，私聊 /groups 启用与切换；群数据独立\n'
+                    '• /rank — 私聊查看排行榜，每页 50 人，按钮翻页，不艾特榜单成员\n'
+                    f'• 达标榜：/milestones — 首次达到 {self.upgrade_points} 分的前 50 位，不要求特定标签\n'
                     '• 汇率换算：/rate 100 USD CNY（或 /rate USD CNY）\n'
                     '• BIN 查询：/bin 45717360 — 输入 6–8 位 BIN\n'
-                    '• 空投：/airdrop 最低积分 [活跃分钟] [中奖人数] 奖品 — 普通成员每天可申请一次；/airdrops [编号] 查看最近 20 条或详情\n'
-                    f'• AI 问答：/ai 你的问题；或回复文字、图片、相册发送 /ai — {ai_cooldown}，管理员不限\n'
                     f'• 入群验证：先关注关联频道，再完成算术题，{verify_time} 内最多答错 3 次\n'
                     '• 解封申请：被拉黑后私聊 /appeal 理由；也可先 /appeal 再填写，/cancel 取消填写；每天最多一次，待审不可重复提交')
         admins = ('<b>仅管理员</b>\n'
-                  '• /manage [ID/@用户名] — 回复成员消息打开管理面板；查看警告、禁言、拉黑、解封和白名单，全部使用按钮\n'
+                  '• /manage [ID/@用户名] — 回复成员消息打开管理面板；查看警告、禁言、拉黑、解封和白名单，全部使用按钮；不填目标可查看群内机器人\n'
                   '• /manage — 查看本群黑白名单，选择成员管理\n'
-                  '• 空投审核：普通成员申请由任一群管理员同意或拒绝；管理员每日额度外的申请仍需群主批准\n'
-                  '• 多群管理：群主在新群发送 /group_add 登记，私聊 /groups 启停群组、切换当前私聊群；数据各自独立\n'
                   '• /audit 最近 100 条全部日志；/audit ID 查看该用户日志；/status 运行状态；/help 查看此完整功能帮助')
         owner = ('<b>仅群主 · 私聊</b>\n'
                  '• /settings — 私聊选择群和配置项，直接发送新值，或 /cancel 取消\n'
@@ -939,14 +913,15 @@ class Bot:
         automatic = (f'<b>自动规则</b>\n'
                      f'• 达到 {self.upgrade_points} 分发送「第 N 位达标」恭喜消息，30 秒后自动删除；已有自定义标签也会通知\n'
                      f'• 符合条件时升级为「{html.escape(self.upgrade_tag)}」，不覆盖已有标签\n'
-                     '• 连续 3 个完整自然日每天签到、没有正常发言：拉黑并清零积分\n'
+                     '• 连续 3 个完整自然日每天签到、没有正常发言：按本群默认禁言时长禁言，积分不清零\n'
                      '• 广告举报仅通过回复消息发送 /report 触发；群内投票确认后处罚\n'
-                     '• 用户命令源消息保留；普通机器人消息 30 秒后删除；积分与榜单结果仅私聊展示')
-        footer = ('群内机器人操作不设每日次数上限；签到、空投额度和 AI 冷却仍按各自规则执行。\n'
+                     '• 用户命令源消息保留；普通成功提示 30 秒后删除，失败及处罚通知 2 分钟；私聊旧填写步骤结束后 30 秒清理，预览和结果保留')
+        footer = ('群内机器人操作不设每日次数上限；签到仍按规则执行。\n'
                   '管理目标可回复消息指定，或填写数字 ID / 已知 @用户名；匿名管理员请切换个人身份。')
-        text = f'🤖 <b>功能菜单 · 2026-10-05</b>\n\n{everyone}\n\n{admins}\n\n{owner}\n\n{automatic}\n\n{footer}'
+        text = f'🤖 <b>功能菜单 · 2026-11-04</b>\n\n{everyone}\n\n{admins}\n\n{owner}\n\n{automatic}\n\n{footer}'
         self.send(chat, text, reply_parameters={'message_id': msg['message_id'], 'allow_sending_without_reply': True},
-                  link_preview_options={'is_disabled': True})
+                  link_preview_options={'is_disabled': True},
+                  )
         return True
 
     def command(self, msg, update_id):
@@ -964,7 +939,7 @@ class Bot:
         return False
 
     def _moderation_action(self, msg, update_id):
-        """内部管理服务：面板调用旧动作解析器；不向用户注册独立管理命令。
+        """内部管理服务：面板调用统一动作服务；不向用户注册独立管理命令。
 
         每次仍重新核验管理员和目标身份。公开入口只允许 /manage、/audit、/status。
         """
@@ -1120,7 +1095,7 @@ class Bot:
                 except APIError as exc:
                     if pending['kind'] != 'request' or exc.code != 400 or 'user_already_participant' not in exc.description.lower():
                         LOG.warning('Whitelist restore failed uid=%s: %s', target, exc)
-            self.send(self.group, f'✅ 已将用户 {target} 加入白名单：豁免广告检测、三日自动黑名单、AI 冷却与入群验证。')
+            self.send(self.group, f'✅ 已将用户 {target} 加入白名单：豁免广告检测、三日异常签到禁言与入群验证。')
             self.audit(uid, target, 'whitelist', note)
         elif cmd == '/unwhite':
             if not self.db.execute('SELECT 1 FROM whitelist WHERE uid=?', (target,)).fetchone():
@@ -1132,7 +1107,40 @@ class Bot:
             self.audit(uid, target, 'unwhitelist')
         return True
 
-    def joined(self, user):
+    def reward_invite(self, user, inviter=None, timestamp=None):
+        if user.get('is_bot') or user['id'] == self.bot_id or self.blacklisted(user['id']):
+            return
+        if inviter and (inviter.get('is_bot') or inviter['id'] == self.bot_id or
+                        self.blacklisted(inviter['id']) or self.db.execute(
+                            "SELECT 1 FROM verification WHERE uid=? AND kind!='approved'", (inviter['id'],)).fetchone()):
+            inviter = None
+        if inviter and inviter['id'] != user['id']:
+            # Do not consume the update on a transient permission lookup failure.
+            member = self.call('getChatMember', chat_id=self.group, user_id=inviter['id'])
+            active = member.get('status') in ('creator', 'administrator', 'member') or (
+                member.get('status') == 'restricted' and member.get('is_member'))
+            if not active:
+                inviter = None
+        amount, status = self.points.invite(inviter, user['id'], timestamp)
+        if status == 'added':
+            self.upgrade_member(inviter['id'])
+
+    def joined(self, user, inviter=None):
+        if user.get('is_bot') and user['id']!=self.bot_id and not self.blacklisted(user['id']):
+            self.members.remember(user)
+            try:
+                allowed=bool(inviter and not inviter.get('is_bot') and self.admin(inviter['id']))
+            except APIError:
+                allowed=False
+            with self.db:
+                self.db.execute('UPDATE known_bots SET inviter=?,approved=? WHERE uid=?',((inviter or {}).get('id'),int(allowed),user['id']))
+            if allowed:
+                with self.db:self.db.execute('DELETE FROM verification WHERE uid=?',(user['id'],))
+                self.audit(inviter['id'],user['id'],'allow_invited_bot')
+                return
+            self.call('banChatMember',chat_id=self.group,user_id=user['id'])
+            self.audit((inviter or {}).get('id',0),user['id'],'reject_invited_bot')
+            return
         row = self.db.execute('SELECT * FROM verification WHERE uid=?', (user['id'],)).fetchone()
         if row and row['passed'] and row['expires'] > time.time():
             return
@@ -1140,10 +1148,7 @@ class Bot:
 
     def handle(self, update):
         msg = update.get('message') or update.get('edited_message') or {}
-        self.ai.media.observe(msg)
-        command_words=msg.get('text','').strip().split()
-        if self.group_manager_root and command_words and command_words[0].split('@')[0].lower() == '/group_add':
-            self.add_managed_group(msg)
+        if not self.accepts_update(update):
             return
         self.members.observe(update)
         if 'callback_query' in update:
@@ -1155,8 +1160,6 @@ class Bot:
                 return
             if self.ranking_callback(update['callback_query']):
                 return
-            if self.airdrops.callback(update['callback_query']):
-                return
             self.callback(update['callback_query'])
         elif 'chat_join_request' in update:
             req = update['chat_join_request']
@@ -1165,6 +1168,7 @@ class Bot:
                     self.call('declineChatJoinRequest', chat_id=self.group, user_id=req['from']['id'])
                     self.audit(0, req['from']['id'], 'blacklist_join_request')
                     return
+                self.invitations.request(req)
                 self.start_verification(req['from'], 'request', req['user_chat_id'])
         elif 'chat_member' in update:
             event = update['chat_member']
@@ -1178,7 +1182,9 @@ class Bot:
                     self.call('banChatMember', chat_id=self.group, user_id=new['user']['id'])
                     self.audit(0, new['user']['id'], 'blacklist_rejoin')
                     return
-                self.joined(new['user'])
+                inviter = self.invitations.inviter(event)
+                self.reward_invite(new['user'], inviter, event.get('date'))
+                self.joined(new['user'],event.get('from'))
             elif active(old) and not active(new):
                 with self.db:
                     self.db.execute('DELETE FROM verification WHERE uid=?', (new['user']['id'],))
@@ -1192,9 +1198,7 @@ class Bot:
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and self.help_command(msg):
                 return
-            if msg['chat'].get('type') == 'private' and 'message' in update and self.ai.command(msg):
-                return
-            if msg['chat'].get('type') == 'private' and 'message' in update and self.airdrops.command(msg):
+            if 'message' in update and self.invitations.command(msg):
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and self.points_command(msg):
                 return
@@ -1203,8 +1207,8 @@ class Bot:
             if msg['chat'].get('type') == 'private' and 'message' in update and self.command(msg, update['update_id']):
                 return
             if msg['chat']['id'] != self.group:
-                if msg['chat'].get('type') == 'private' and msg.get('text', '').startswith('/start'):
-                    self.send(msg['chat']['id'], '请从群组入口申请加入，然后完成本机器人发送的频道关注与人机验证。\nhttps://t.me/setupode')
+                if msg['chat'].get('type') == 'private':
+                    self.send(msg['chat']['id'], '这里只处理机器人支持的私聊功能，发送 /help 查看可用功能。')
                 return
         # sender_chat identifies channel posts even when Telegram also includes a bot-like from field.
             sender = msg.get('sender_chat')
@@ -1212,7 +1216,7 @@ class Bot:
                 # Telegram only exposes some other-bot messages; queue the ones we do see.
                 self.schedule_delete(msg['chat']['id'], msg['message_id'])
             for user in msg.get('new_chat_members', []):
-                self.joined(user)
+                self.joined(user,msg.get('from'))
             if msg.get('is_automatic_forward'):
                 return
             if 'edited_message' in update:
@@ -1224,17 +1228,14 @@ class Bot:
             uid = msg['from']['id']
             if uid == self.bot_id:
                 return
-            self.history.record(msg)
             if not msg['from'].get('is_bot'):
                 with self.db:
                     self.db.execute('INSERT INTO user_activity(uid,last_active) VALUES(?,?) ON CONFLICT(uid) DO UPDATE SET last_active=excluded.last_active', (uid, int(msg.get('date') or time.time())))
             if 'message' in update and not self.whitelisted(uid):
                 self.attention.observed(msg)
+            if 'message' in update and self.invitations.command(msg):
+                return
             if 'message' in update and self.help_command(msg):
-                return
-            if 'message' in update and self.ai.command(msg):
-                return
-            if 'message' in update and self.airdrops.command(msg):
                 return
             if 'message' in update and self.points_command(msg):
                 return
@@ -1249,7 +1250,7 @@ class Bot:
             if pending and not self.whitelisted(uid):
                 return
             content = any(msg.get(key) for key in ('text','photo','video','animation','audio','voice','video_note','document','sticker','poll','contact','location','venue','dice'))
-            if 'message' in update and content and not msg.get('text','').startswith('/') and self.avatar_visible(uid) is True:
+            if 'message' in update and content and not msg.get('text','').startswith('/') and self.avatar_visible(uid, message_id=msg.get('message_id'), purpose='message') is True:
                 amount, status = self.points.award(msg['from'],'message',f'message:{self.group}:{msg["message_id"]}',msg.get('date'))
                 if status == 'added':
                     self.upgrade_member(uid)
@@ -1258,9 +1259,6 @@ class Bot:
         rows = self.db.execute("SELECT * FROM verification WHERE expires<? AND kind!='approved'", (int(time.time()),)).fetchall()
         for row in rows:
             if self.whitelisted(row['uid']):
-                with self.db:
-                    self.db.execute("UPDATE verification SET passed=1,kind='approved',expires=? WHERE uid=?",
-                                    (int(time.time()) + 86400, row['uid']))
                 try:
                     if row['kind'] == 'member':
                         self.restore(row['uid'])
@@ -1269,91 +1267,19 @@ class Bot:
                 except APIError as exc:
                     if row['kind'] != 'request' or exc.code != 400 or 'user_already_participant' not in exc.description.lower():
                         LOG.warning('Whitelist verification restore failed uid=%s: %s', row['uid'], exc)
+                        continue
+                with self.db:
+                    self.db.execute("UPDATE verification SET passed=1,kind='approved',expires=? WHERE uid=?",
+                                    (int(time.time()) + 86400, row['uid']))
                 continue
             try:
                 self.reject(row)
             except APIError as exc:
                 LOG.warning('Expiry failed uid=%s: %s', row['uid'], exc)
 
-    def _init_group_manager(self):
-        """Load independently stored group profiles; one poller owns the bot token."""
-        self.group_manager_root = True
-        self.managed_bots = {self.group: self}
-        self.db.executescript('''
-        CREATE TABLE IF NOT EXISTS managed_groups(
-          chat INTEGER PRIMARY KEY,channel INTEGER NOT NULL,title TEXT NOT NULL,
-          db_path TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,
-          channel_url TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS group_setting_sessions(
-          uid INTEGER PRIMARY KEY,group_id INTEGER NOT NULL,key TEXT NOT NULL,
-          prompt_message_id INTEGER NOT NULL,panel_message_id INTEGER NOT NULL,
-          expires INTEGER NOT NULL);
-        ''')
-        root_path = str(Path(self.cfg.get('DB_PATH', 'bot.sqlite3')).resolve())
+    def _settings_owner_status(self, bot, uid):
         try:
-            root_info = self.call('getChat', chat_id=self.group)
-            title = root_info.get('title') or str(self.group)
-        except Exception:
-            title = str(self.group)
-        existing_root = self.db.execute('SELECT channel FROM managed_groups WHERE chat=?',
-                                        (self.group,)).fetchone()
-        root_channel = int(existing_root['channel']) if existing_root else self.channel
-        try:
-            root_channel_info = self.call('getChat', chat_id=root_channel)
-        except Exception:
-            root_channel_info = {}
-        root_fallback = self.channel_url if root_channel == self.channel else ''
-        root_channel_url = self._channel_url_from_chat(root_channel_info, root_fallback)
-        with self.db:
-            self.db.execute('INSERT OR IGNORE INTO managed_groups(chat,channel,title,db_path,enabled,channel_url) VALUES(?,?,?,?,1,?)',
-                            (self.group, self.channel, title, root_path, root_channel_url))
-            self.db.execute('UPDATE managed_groups SET channel_url=? WHERE chat=? AND channel_url=\'\'',
-                            (root_channel_url, self.group))
-            self.db.execute("INSERT OR IGNORE INTO meta VALUES('active_group',?)", (str(self.group),))
-        rows = self.db.execute('SELECT * FROM managed_groups ORDER BY chat').fetchall()
-        for row in rows:
-            channel_url = row['channel_url'] or ''
-            if not channel_url:
-                try:
-                    channel_info = self.call('getChat', chat_id=row['channel'])
-                except Exception:
-                    channel_info = {}
-                fallback = self.channel_url if row['channel'] == self.channel else ''
-                channel_url = self._channel_url_from_chat(channel_info, fallback)
-                if channel_url:
-                    with self.db:
-                        self.db.execute('UPDATE managed_groups SET channel_url=? WHERE chat=?',
-                                        (channel_url, row['chat']))
-            if row['chat'] == self.group:
-                self.channel = int(row['channel'])
-                self.cfg['CHANNEL_ID'] = str(self.channel)
-                self.channel_url = channel_url
-                self.cfg['TELEGRAM_CHANNEL_URL'] = channel_url
-                continue
-            tenant_cfg = dict(self.base_cfg) | {'GROUP_ID': str(row['chat']), 'CHANNEL_ID': str(row['channel']),
-                                           'DB_PATH': row['db_path'],
-                                           'TELEGRAM_CHANNEL_URL': channel_url}
-            tenant = Bot(tenant_cfg, api=self.api)
-            tenant.username, tenant.bot_id = self.username, self.bot_id
-            tenant.manager_root = self
-            self.managed_bots[row['chat']] = tenant
-        active = self.db.execute("SELECT value FROM meta WHERE key='active_group'").fetchone()
-        if not active or int(active[0]) not in self.managed_bots:
-            with self.db: self.db.execute("INSERT OR REPLACE INTO meta VALUES('active_group',?)", (str(self.group),))
-
-    def _group_admin(self, uid):
-        for group in self.managed_bots.values():
-            try:
-                member = group.call('getChatMember', chat_id=group.group, user_id=uid)
-                if member.get('status') in ('creator', 'administrator'):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _settings_owner_status(self, tenant, uid):
-        try:
-            return tenant.call('getChatMember', chat_id=tenant.group, user_id=uid).get('status') == 'creator'
+            return bot.call('getChatMember', chat_id=bot.group, user_id=uid).get('status') == 'creator'
         except APIError:
             return None
 
@@ -1362,20 +1288,14 @@ class Bot:
             return '开启' if value else '关闭'
         return str(value) if value != '' else '未设置'
 
-    def _settings_panel(self, tenant, title, uid):
-        row = self.db.execute('SELECT channel,channel_url FROM managed_groups WHERE chat=?',
-                              (tenant.group,)).fetchone()
-        channel_id = row['channel'] if row else tenant.channel
-        channel_url = (row['channel_url'] if row else tenant.channel_url) or ''
-        lines = [f'⚙️ <b>{html.escape(title)}</b>（<code>{tenant.group}</code>）设置',
+    def _settings_panel(self, bot, title, uid):
+        channel_id = self.channel
+        channel_url = self.channel_url
+        lines = [f'⚙️ <b>{html.escape(title)}</b>（<code>{bot.group}</code>）设置',
                  '点击下方项目修改；数值设置请直接发送新值，或用 /cancel 取消。']
-        range_text = f'{tenant.checkin_min}–{tenant.checkin_max}'
-        lines.append(f'• 签到积分范围：<b>{range_text}</b>（每天一次）')
-        for key, spec in tenant.GROUP_SETTING_SPECS.items():
-            if key in ('CHECKIN_MIN', 'CHECKIN_MAX'):
-                continue
-            value = html.escape(self._setting_display(key, tenant.setting_values[key]))
-            origin = '自定义' if key in tenant.setting_overrides else '默认'
+        for key, spec in bot.GROUP_SETTING_SPECS.items():
+            value = html.escape(self._setting_display(key, bot.setting_values[key]))
+            origin = '自定义' if key in bot.setting_overrides else '默认'
             lines.append(f'• {html.escape(spec["label"])}：<b>{value}</b> · {origin}')
         escaped_url = html.escape(channel_url, quote=True)
         channel_text = f'<a href="{escaped_url}">{html.escape(channel_url)}</a>' if channel_url else '未设置'
@@ -1383,19 +1303,17 @@ class Bot:
                       f'• 关注频道链接：{channel_text}',
                       '', '机器人令牌、AI API 密钥和 API 地址由部署环境管理。'])
 
-        values = [('CHECKIN_RANGE', '签到积分范围', range_text)]
-        for key, spec in tenant.GROUP_SETTING_SPECS.items():
-            if key in ('CHECKIN_MIN', 'CHECKIN_MAX'):
-                continue
-            values.append((key, spec['label'], self._setting_display(key, tenant.setting_values[key])))
+        values = [(key, spec['label'], self._setting_display(key, bot.setting_values[key]))
+                  for key, spec in bot.GROUP_SETTING_SPECS.items()]
         rows = []
         pair = []
         for key, label, value in values:
+            spec = bot.GROUP_SETTING_SPECS[key]
             action = 't' if spec['type'] == 'bool' else 'e'
-            value_label = '开' if spec['type'] == 'bool' and tenant.setting_values[key] else (
+            value_label = '开' if spec['type'] == 'bool' and bot.setting_values[key] else (
                 '关' if spec['type'] == 'bool' else str(value))
             button = {'text': f'{label} · {value_label}'[:60],
-                      'callback_data': f'gs:{action}:{tenant.group}:{uid}:{key}'}
+                      'callback_data': f'gs:{action}:{bot.group}:{uid}:{key}'}
             pair.append(button)
             if len(pair) == 2:
                 rows.append(pair)
@@ -1403,49 +1321,30 @@ class Bot:
         if pair:
             rows.append(pair)
         rows.append([
-            {'text': '入群验证频道', 'callback_data': f'gs:e:{tenant.group}:{uid}:CHANNEL_ID'},
-            {'text': '频道邀请链接', 'callback_data': f'gs:e:{tenant.group}:{uid}:CHANNEL_URL'},
+            {'text': '入群验证频道', 'callback_data': f'gs:e:{bot.group}:{uid}:CHANNEL_ID'},
+            {'text': '频道邀请链接', 'callback_data': f'gs:e:{bot.group}:{uid}:CHANNEL_URL'},
         ])
         resettable = []
-        if tenant.setting_overrides.intersection({'CHECKIN_MIN', 'CHECKIN_MAX'}):
-            resettable.append({'text': '签到范围恢复默认',
-                               'callback_data': f'gs:r:{tenant.group}:{uid}:CHECKIN_RANGE'})
-        for key in tenant.GROUP_SETTING_SPECS:
-            if key in ('CHECKIN_MIN', 'CHECKIN_MAX') or key not in tenant.setting_overrides:
+        for key in bot.GROUP_SETTING_SPECS:
+            if key not in bot.setting_overrides:
                 continue
-            resettable.append({'text': f'恢复{tenant.GROUP_SETTING_SPECS[key]["label"][:14]}',
-                               'callback_data': f'gs:r:{tenant.group}:{uid}:{key}'})
+            resettable.append({'text': f'恢复{bot.GROUP_SETTING_SPECS[key]["label"][:14]}',
+                               'callback_data': f'gs:r:{bot.group}:{uid}:{key}'})
         for index in range(0, len(resettable), 2):
             rows.append(resettable[index:index + 2])
         return '\n'.join(lines), {'inline_keyboard': rows}
 
     def _settings_title(self, gid):
-        row = self.db.execute('SELECT title FROM managed_groups WHERE chat=?', (gid,)).fetchone()
-        return row['title'] if row else str(gid)
+        return self.group_title
 
-    def _show_settings_panel(self, uid, tenant, message=None):
-        text, markup = self._settings_panel(tenant, self._settings_title(tenant.group), uid)
+    def _show_settings_panel(self, uid, bot, message=None):
+        text, markup = self._settings_panel(bot, self._settings_title(bot.group), uid)
         if message:
             self.call('editMessageText', chat_id=message['chat']['id'],
                       message_id=message['message_id'], text=text, parse_mode='HTML',
                       reply_markup=markup, disable_web_page_preview=True)
         else:
             self.send(uid, text, keep=True, reply_markup=markup, disable_web_page_preview=True)
-
-    def _settings_group_picker(self, uid, owned, message=None):
-        lines = ['⚙️ <b>选择要修改的管理群</b>']
-        buttons = []
-        for tenant, title in owned:
-            lines.append(f'• {html.escape(title)}（<code>{tenant.group}</code>）')
-            buttons.append([{'text': title[:50], 'callback_data': f'gs:g:{tenant.group}:{uid}'}])
-        markup = {'inline_keyboard': buttons}
-        text = '\n'.join(lines)
-        if message:
-            self.call('editMessageText', chat_id=message['chat']['id'],
-                      message_id=message['message_id'], text=text, parse_mode='HTML',
-                      reply_markup=markup)
-        else:
-            self.send(uid, text, keep=True, reply_markup=markup)
 
     def group_settings_command(self, msg):
         """Open private button-based settings for groups owned by the caller."""
@@ -1463,28 +1362,20 @@ class Bot:
         if not uid:
             return True
         if len(tokens) != 1:
-            self.send(chat['id'], '设置现已改为按钮操作，请直接发送 /settings 并选择管理群。')
+            self.send(chat['id'], '设置现已改为按钮操作，请直接发送 /settings 。')
             return True
-        owned = []
-        for row in self.db.execute('SELECT chat,title FROM managed_groups ORDER BY title COLLATE NOCASE,chat').fetchall():
-            tenant = self.managed_bots.get(row['chat'])
-            if tenant and self._settings_owner_status(tenant, uid):
-                owned.append((tenant, row['title']))
-        if not owned:
-            self.send(chat['id'], '只有已登记管理群的群主可以查看和修改群组设置。')
-        elif len(owned) == 1:
-            self._show_settings_panel(uid, owned[0][0])
+        if self._settings_owner_status(self, uid):
+            self._show_settings_panel(uid, self)
         else:
-            self._settings_group_picker(uid, owned)
+            self.send(chat['id'], '只有本群群主可以查看和修改设置。', _delete_after=0)
         return True
 
-    def _settings_value_prompt(self, uid, tenant, key, panel_message, error=''):
+    def _settings_value_prompt(self, uid, bot, key, panel_message, error=''):
         prompts = {
-            'CHECKIN_RANGE': '请直接发送签到积分范围，例如 5-10（每天仍限签到一次）。',
             'CHANNEL_ID': '请直接发送该群绑定的频道 @用户名 或频道数字 ID。机器人必须是该频道管理员。',
             'CHANNEL_URL': '请直接发送关注频道链接（https://t.me/...），支持公开频道和私有邀请链接。',
         }
-        spec = tenant.GROUP_SETTING_SPECS.get(key)
+        spec = bot.GROUP_SETTING_SPECS.get(key)
         prompt = prompts.get(key)
         if not prompt and spec:
             prompt = f'请直接发送“{spec["label"]}”的新值。'
@@ -1494,10 +1385,11 @@ class Bot:
                 prompt += ' 限 1–16 个 UTF-16 字符，不能含 Emoji。'
         response = self.send(uid, (html.escape(error) + '\n' if error else '') + prompt + '\n直接发送新值，或用 /cancel 取消（10 分钟内有效）。',
                              keep=True)
+        self.track_private_step(uid, response['message_id'], 'settings', lifetime=600)
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO group_setting_sessions'
                             '(uid,group_id,key,prompt_message_id,panel_message_id,expires) VALUES(?,?,?,?,?,?)',
-                            (uid, tenant.group, key, response['message_id'], panel_message['message_id'],
+                            (uid, bot.group, key, response['message_id'], panel_message['message_id'],
                              int(time.time()) + 600))
 
     def _valid_channel_url(self, raw):
@@ -1509,26 +1401,26 @@ class Bot:
             raise ValueError('请提供有效的 https://t.me/... 频道链接。')
         return 'https://' + parsed.netloc.lower() + parsed.path
 
-    def _save_tenant_setting(self, tenant, key, value):
-        with tenant.db:
-            tenant.db.execute('INSERT OR REPLACE INTO group_settings(key,value) VALUES(?,?)',
+    def _save_setting(self, bot, key, value):
+        with bot.db:
+            bot.db.execute('INSERT OR REPLACE INTO group_settings(key,value) VALUES(?,?)',
                               (key, '1' if value is True else '0' if value is False else str(value)))
-        tenant.setting_values[key] = value
-        tenant.setting_overrides.add(key)
-        tenant._apply_group_settings()
+        bot.setting_values[key] = value
+        bot.setting_overrides.add(key)
+        bot._apply_group_settings()
 
-    def _reset_tenant_setting(self, tenant, key):
-        keys = ('CHECKIN_MIN', 'CHECKIN_MAX') if key == 'CHECKIN_RANGE' else (key,)
-        with tenant.db:
-            tenant.db.executemany('DELETE FROM group_settings WHERE key=?', ((item,) for item in keys))
+    def _reset_setting(self, bot, key):
+        keys = (key,)
+        with bot.db:
+            bot.db.executemany('DELETE FROM group_settings WHERE key=?', ((item,) for item in keys))
         for item in keys:
-            tenant.setting_values[item] = tenant.setting_defaults[item]
-            tenant.setting_overrides.discard(item)
-        tenant._apply_group_settings()
+            bot.setting_values[item] = bot.setting_defaults[item]
+            bot.setting_overrides.discard(item)
+        bot._apply_group_settings()
 
-    def _settings_refresh_message(self, uid, tenant, message):
+    def _settings_refresh_message(self, uid, bot, message):
         try:
-            self._show_settings_panel(uid, tenant, message)
+            self._show_settings_panel(uid, bot, message)
         except APIError as exc:
             # Telegram may reject an edit when the panel already has identical content.
             if exc.code != 400 or 'message is not modified' not in exc.description.lower():
@@ -1543,10 +1435,7 @@ class Bot:
                                            show_alert=bool(text))
         try:
             action = fields[1]
-            if action == 'g' and len(fields) == 4:
-                gid, uid = int(fields[2]), int(fields[3])
-                key = ''
-            elif action in ('e', 't', 'r') and len(fields) == 5:
+            if action in ('e', 't', 'r') and len(fields) == 5:
                 gid, uid, key = int(fields[2]), int(fields[3]), fields[4]
             else:
                 answer('设置按钮已失效，请重新发送 /settings。')
@@ -1559,50 +1448,44 @@ class Bot:
         if msg.get('chat', {}).get('type') != 'private' or caller != uid:
             answer('此设置按钮不属于你。')
             return True
-        tenant = self.managed_bots.get(gid)
-        if not tenant or not self.db.execute('SELECT 1 FROM managed_groups WHERE chat=?', (gid,)).fetchone():
+        bot = self
+        if gid != self.group:
             answer('该管理群已不存在。')
             return True
-        status = self._settings_owner_status(tenant, uid)
+        status = self._settings_owner_status(bot, uid)
         if status is None:
             answer('暂时无法核实你的群主身份。')
             return True
         if not status:
             answer('只有该群群主可以修改设置。')
             return True
-        if action == 'g':
-            self._settings_refresh_message(uid, tenant, msg)
-            answer()
-            return True
         if action == 't':
-            if key not in tenant.GROUP_SETTING_SPECS or tenant.GROUP_SETTING_SPECS[key]['type'] != 'bool':
+            if key not in bot.GROUP_SETTING_SPECS or bot.GROUP_SETTING_SPECS[key]['type'] != 'bool':
                 answer('设置按钮无效。')
                 return True
-            value = not tenant.setting_values[key]
-            self._save_tenant_setting(tenant, key, value)
-            tenant.audit(uid, 0, 'group_setting_set', f'{key}={value}')
-            self._settings_refresh_message(uid, tenant, msg)
+            value = not bot.setting_values[key]
+            self._save_setting(bot, key, value)
+            bot.audit(uid, 0, 'group_setting_set', f'{key}={value}')
+            self._settings_refresh_message(uid, bot, msg)
             answer()
             return True
         if action == 'r':
-            if key == 'CHECKIN_RANGE':
-                self._reset_tenant_setting(tenant, key)
-            elif key in tenant.GROUP_SETTING_SPECS and key in tenant.setting_overrides:
-                self._reset_tenant_setting(tenant, key)
+            if key in bot.GROUP_SETTING_SPECS and key in bot.setting_overrides:
+                self._reset_setting(bot, key)
             else:
                 answer('此项目没有自定义值可恢复。')
                 return True
-            tenant.audit(uid, 0, 'group_setting_reset', key)
-            self._settings_refresh_message(uid, tenant, msg)
+            bot.audit(uid, 0, 'group_setting_reset', key)
+            self._settings_refresh_message(uid, bot, msg)
             answer()
             return True
         if action == 'e':
-            allowed = set(tenant.GROUP_SETTING_SPECS) - {'JEV_ENABLED', 'CHECKIN_MIN', 'CHECKIN_MAX'}
-            allowed.update(('CHECKIN_RANGE', 'CHANNEL_ID', 'CHANNEL_URL'))
+            allowed = set(bot.GROUP_SETTING_SPECS) - {'JEV_ENABLED'}
+            allowed.update(('CHANNEL_ID', 'CHANNEL_URL'))
             if key not in allowed:
                 answer('设置按钮无效。')
                 return True
-            self._settings_value_prompt(uid, tenant, key, msg)
+            self._settings_value_prompt(uid, bot, key, msg)
             answer()
             return True
         return True
@@ -1621,40 +1504,33 @@ class Bot:
         if text.split(maxsplit=1)[0].split('@')[0].lower() == '/cancel' if text else False:
             with self.db:
                 self.db.execute('DELETE FROM group_setting_sessions WHERE uid=?', (uid,))
+            self.finish_private_steps(uid, 'settings')
             self.send(uid, '已取消本次设置。')
             return True
         if int(session['expires']) < time.time():
             with self.db:
                 self.db.execute('DELETE FROM group_setting_sessions WHERE uid=?', (uid,))
+            self.finish_private_steps(uid, 'settings')
             return False
-        tenant = self.managed_bots.get(session['group_id'])
-        if not tenant or self._settings_owner_status(tenant, uid) is not True:
+        bot = self
+        if session['group_id'] != self.group or self._settings_owner_status(bot, uid) is not True:
             with self.db:
                 self.db.execute('DELETE FROM group_setting_sessions WHERE uid=?', (uid,))
+            self.finish_private_steps(uid, 'settings')
             self.send(uid, '群主身份已变化，设置操作已取消。')
             return True
         key = session['key']
-        if key not in tenant.GROUP_SETTING_SPECS and key not in ('CHECKIN_RANGE', 'CHANNEL_ID', 'CHANNEL_URL'):
+        if key not in bot.GROUP_SETTING_SPECS and key not in ('CHANNEL_ID', 'CHANNEL_URL'):
             with self.db:
                 self.db.execute('DELETE FROM group_setting_sessions WHERE uid=?', (uid,))
+            self.finish_private_steps(uid, 'settings')
             self.send(uid, '此设置已移除，请重新发送 /settings。')
             return True
         if text.startswith('/') or not text:
             self.send(uid, '请直接发送新参数，或用 /cancel 取消。')
             return True
         try:
-            if key == 'CHECKIN_RANGE':
-                match = re.fullmatch(r'\s*(\d+)\s*[-–]\s*(\d+)\s*', text)
-                if not match:
-                    raise ValueError('签到积分范围格式示例：5-10。')
-                low = tenant.parse_group_setting('CHECKIN_MIN', match.group(1))
-                high = tenant.parse_group_setting('CHECKIN_MAX', match.group(2))
-                if low > high:
-                    raise ValueError('签到下限不能高于上限。')
-                self._save_tenant_setting(tenant, 'CHECKIN_MIN', low)
-                self._save_tenant_setting(tenant, 'CHECKIN_MAX', high)
-                audit_value = f'{low}-{high}'
-            elif key == 'CHANNEL_ID':
+            if key == 'CHANNEL_ID':
                 info = self.call('getChat', chat_id=text)
                 if info.get('type') != 'channel':
                     raise ValueError('该 ID/用户名不是频道。')
@@ -1663,343 +1539,109 @@ class Bot:
                     raise ValueError('机器人必须先成为该频道管理员。')
                 link = self._channel_url_from_chat(info, '')
                 with self.db:
-                    self.db.execute('UPDATE managed_groups SET channel=?,channel_url=? WHERE chat=?',
-                                    (info['id'], link, tenant.group))
-                tenant.channel = int(info['id'])
-                tenant.channel_url = link
-                tenant.cfg['CHANNEL_ID'] = str(info['id'])
-                tenant.cfg['TELEGRAM_CHANNEL_URL'] = link
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES('verification_channel',?)", (str(info['id']),))
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES('verification_channel_url',?)", (link,))
+                bot.channel = int(info['id'])
+                bot.channel_url = link
+                bot.cfg['CHANNEL_ID'] = str(info['id'])
+                bot.cfg['TELEGRAM_CHANNEL_URL'] = link
                 audit_value = str(info['id'])
             elif key == 'CHANNEL_URL':
                 value = self._valid_channel_url(text)
                 with self.db:
-                    self.db.execute('UPDATE managed_groups SET channel_url=? WHERE chat=?',
-                                    (value, tenant.group))
-                tenant.channel_url = value
-                tenant.cfg['TELEGRAM_CHANNEL_URL'] = value
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES('verification_channel_url',?)", (value,))
+                bot.channel_url = value
+                bot.cfg['TELEGRAM_CHANNEL_URL'] = value
                 audit_value = value
             else:
-                value = tenant.parse_group_setting(key, text)
-                self._save_tenant_setting(tenant, key, value)
+                value = bot.parse_group_setting(key, text)
+                self._save_setting(bot, key, value)
                 audit_value = str(value)
         except (ValueError, APIError, KeyError) as exc:
             error = str(exc) if isinstance(exc, ValueError) else '读取或验证频道失败，请检查频道 ID 和机器人权限后重试。'
-            self._settings_value_prompt(uid, tenant, key,
+            self._settings_value_prompt(uid, bot, key,
                                         {'message_id': session['panel_message_id']}, error)
             return True
         with self.db:
             self.db.execute('DELETE FROM group_setting_sessions WHERE uid=?', (uid,))
-        tenant.audit(uid, 0, 'group_setting_set', f'{key}={audit_value}')
+            self.finish_private_steps(uid, 'settings')
+        bot.audit(uid, 0, 'group_setting_set', f'{key}={audit_value}')
         panel_msg = {'chat': msg['chat'], 'message_id': session['panel_message_id']}
-        self._settings_refresh_message(uid, tenant, panel_msg)
+        self._settings_refresh_message(uid, bot, panel_msg)
         return True
 
-    def add_managed_group(self, msg):
-        chat = msg.get('chat', {})
-        uid = msg.get('from', {}).get('id')
-        if chat.get('type') not in ('group', 'supergroup') or not uid or msg.get('sender_chat'):
-            return
-        gid = int(chat['id'])
-        def notice(text): self.api.call('sendMessage', chat_id=gid, text=text)
-        if gid in self.managed_bots:
-            notice('这个群已经登记。群主私聊机器人发送 /groups 可启用或切换当前管理群。')
-            return
-        try:
-            creator = self.call('getChatMember', chat_id=gid, user_id=uid)
-            bot_member = self.call('getChatMember', chat_id=gid, user_id=self.bot_id)
-            if creator.get('status') != 'creator':
-                notice('只有本群群主可以登记该群。')
-                return
-            if bot_member.get('status') not in ('administrator', 'creator'):
-                notice('请先把机器人设为本群管理员，再发送 /group_add。')
-                return
-            for right in ('can_delete_messages', 'can_restrict_members', 'can_invite_users'):
-                if bot_member.get('status') != 'creator' and not bot_member.get(right):
-                    notice('机器人缺少群管理权限，请授予删消息、限制成员和邀请用户权限后重试。')
-                    return
-            parts = msg.get('text', '').split(maxsplit=1)
-            channel = self.channel
-            if len(parts) > 1:
-                channel_info = self.call('getChat', chat_id=parts[1].strip())
-                if channel_info.get('type') != 'channel':
-                    notice('请指定 Telegram 频道的 @用户名 或数字 ID。')
-                    return
-                channel = channel_info['id']
-            channel_info = self.call('getChat', chat_id=channel)
-            if channel_info.get('type') != 'channel':
-                notice('关联对象不是 Telegram 频道。')
-                return
-            channel_url = self._channel_url_from_chat(channel_info, '')
-            channel_member = self.call('getChatMember', chat_id=channel, user_id=self.bot_id)
-            if channel_member.get('status') not in ('administrator','creator'):
-                notice('机器人还不是关联频道管理员，请先授予频道管理员权限后重试。')
-                return
-            title = chat.get('title') or self.call('getChat', chat_id=gid).get('title') or str(gid)
-            root_db = Path(self.cfg.get('DB_PATH', 'bot.sqlite3')).resolve()
-            group_db = root_db.parent / 'groups' / str(abs(gid)) / 'bot.sqlite3'
-            group_db.parent.mkdir(parents=True, exist_ok=True)
-            cfg = dict(self.base_cfg) | {'GROUP_ID': str(gid), 'CHANNEL_ID': str(channel), 'DB_PATH': str(group_db),
-                                    'TELEGRAM_CHANNEL_URL': channel_url}
-            tenant = Bot(cfg, api=self.api)
-            tenant.username, tenant.bot_id = self.username, self.bot_id
-            tenant.manager_root = self
-            tenant.can_manage_tags = bool(bot_member.get('status') == 'creator' or bot_member.get('can_manage_tags'))
-            with self.db:
-                self.db.execute('INSERT INTO managed_groups(chat,channel,title,db_path,enabled,channel_url) VALUES(?,?,?,?,0,?)',
-                                (gid, channel, title, str(group_db), channel_url))
-            self.managed_bots[gid] = tenant
-            notice('✅ 群组已登记。群主私聊机器人发送 /groups，启用该群并将其设为当前管理群。')
-        except Exception as exc:
-            LOG.warning('Group registration failed chat=%s type=%s', gid, type(exc).__name__)
-            notice('登记失败，请确认机器人在关联频道和本群的权限后重试。')
-
-    def group_manager_command(self, msg):
-        text = msg.get('text', '').strip()
-        cmd = text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
-        if cmd != '/groups' or msg.get('chat', {}).get('type') != 'private':
-            return False
-        uid = msg.get('from', {}).get('id')
-        if not uid or not self._group_admin(uid):
-            self.send(msg['chat']['id'], '仅已管理群组的管理员可以查看和切换群配置。')
-            return True
-        rows = self.db.execute('SELECT * FROM managed_groups ORDER BY chat').fetchall()
-        active_row = self.db.execute("SELECT value FROM meta WHERE key='active_group'").fetchone()
-        active = int(active_row[0]) if active_row else self.group
-        lines = ['🛠 管理群组（每个群的数据独立保存）']
-        buttons = []
-        for row in rows:
-            state = '已启用' if row['enabled'] else '已停用'
-            current = ' · 当前私聊管理群' if row['chat'] == active else ''
-            lines.append(f'• {html.escape(row["title"])}（{row["chat"]}）— {state}{current}')
-            buttons.append([
-                {'text': ('停用' if row['enabled'] else '启用') + f' · {row["title"][:18]}',
-                 'callback_data': f'mg:toggle:{row["chat"]}'},
-                {'text': '设为当前', 'callback_data': f'mg:active:{row["chat"]}'}])
-        lines += ['', '在新群先把机器人设为管理员，再由群主在群内发送 /group_add 登记。']
-        self.send(msg['chat']['id'], '\n'.join(lines), reply_markup={'inline_keyboard': buttons})
-        return True
-
-    def group_manager_callback(self, query):
-        data = query.get('data', '').split(':')
-        if len(data) != 3 or data[0] != 'mg' or data[1] not in ('toggle', 'active'):
-            return False
-        try: gid = int(data[2])
-        except ValueError: return True
-        answer = lambda text: self.call('answerCallbackQuery', callback_query_id=query['id'], text=text, show_alert=True)
-        uid = query.get('from', {}).get('id')
-        if not uid or not self._group_admin(uid):
-            answer('仅已管理群组的管理员可以操作。'); return True
-        row = self.db.execute('SELECT * FROM managed_groups WHERE chat=?', (gid,)).fetchone()
-        if not row or gid not in self.managed_bots:
-            answer('群组不存在，请重新发送 /groups。'); return True
-        if data[1] == 'toggle':
-            enabled = 0 if row['enabled'] else 1
-            if enabled:
-                tenant = self.managed_bots[gid]
-                try:
-                    member = tenant.call('getChatMember', chat_id=gid, user_id=self.bot_id)
-                    if member.get('status') not in ('administrator', 'creator'):
-                        answer('机器人已不是该群管理员，无法启用。'); return True
-                    if member.get('status') != 'creator':
-                        missing = [right for right in ('can_delete_messages','can_restrict_members','can_invite_users') if not member.get(right)]
-                        if missing:
-                            answer('机器人缺少必要管理权限，无法启用。'); return True
-                    channel_member=tenant.call('getChatMember',chat_id=tenant.channel,user_id=self.bot_id)
-                    if channel_member.get('status') not in ('administrator','creator'):
-                        answer('机器人还不是关联频道管理员，无法启用。'); return True
-                    tenant.can_manage_tags = bool(member.get('status') == 'creator' or member.get('can_manage_tags'))
-                except Exception:
-                    answer('暂时无法核实机器人权限。'); return True
-            with self.db: self.db.execute('UPDATE managed_groups SET enabled=? WHERE chat=?', (enabled, gid))
-            if not enabled and int(self._active_group()) == gid:
-                replacement=self.db.execute('SELECT chat FROM managed_groups WHERE enabled=1 AND chat!=? ORDER BY chat LIMIT 1',(gid,)).fetchone()
-                if replacement:
-                    with self.db:self.db.execute("INSERT OR REPLACE INTO meta VALUES('active_group',?)",(str(replacement['chat']),))
-            answer('已启用该群机器人功能。' if enabled else '已停用该群机器人功能。')
-        else:
-            if not row['enabled']:
-                answer('请先启用该群。'); return True
-            with self.db: self.db.execute("INSERT OR REPLACE INTO meta VALUES('active_group',?)", (str(gid),))
-            answer('已切换当前私聊管理群。')
-        msg = query.get('message', {})
-        try:
-            self.call('editMessageText', chat_id=msg['chat']['id'], message_id=msg['message_id'],
-                      text='群配置已更新。请再次发送 /groups 查看状态。')
-        except Exception: pass
-        return True
-
-    def _tenant_for_update(self, update):
-        """将更新路由到对应群，避免不同群的积分和管理操作串用。"""
-        if 'callback_query' in update:
-            query = update['callback_query']; data = query.get('data', '')
-            if data.startswith('mg:'): return self
-            message_chat = query.get('message', {}).get('chat', {})
-            if message_chat.get('id') in self.managed_bots:
-                state=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(message_chat['id'],)).fetchone()
-                return self.managed_bots[message_chat['id']] if state and state['enabled'] else None
-            uid = query.get('from', {}).get('id')
-            if data.startswith('v:'):
-                try: nonce = data.split(':')[2]; uid = int(data.split(':')[1])
-                except (ValueError, IndexError): pass
-                for tenant in self.managed_bots.values():
-                    enabled=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(tenant.group,)).fetchone()
-                    if enabled and enabled['enabled'] and tenant.db.execute('SELECT 1 FROM verification WHERE uid=? AND nonce=?', (uid, nonce)).fetchone(): return tenant
-            if data.startswith('appeal:'):
-                fields=data.split(':')
-                if len(fields)==4:
-                    try:
-                        tenant=self.managed_bots.get(int(fields[2]))
-                        state=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(int(fields[2]),)).fetchone()
-                        return tenant if tenant and state and state['enabled'] else None
-                    except ValueError:return None
-                try: aid = int(data.rsplit(':',1)[1])
-                except ValueError: aid = -1
-                for tenant in self.managed_bots.values():
-                    if tenant.db.execute('SELECT 1 FROM appeals WHERE id=? AND state="pending"', (aid,)).fetchone(): return tenant
-            if data.startswith('mod:'):
-                fields = data.split(':')
-                if len(fields) == 4:
-                    try:
-                        gid = int(fields[1])
-                        tenant = self.managed_bots.get(gid)
-                        state = self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?', (gid,)).fetchone()
-                        return tenant if tenant and state and state['enabled'] else None
-                    except ValueError:
-                        return None
-                return None
-            if data.startswith('rank:'):
-                fields=data.split(':')
-                if len(fields)==4:
-                    try:
-                        gid=int(fields[1]);tenant=self.managed_bots.get(gid)
-                        state=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(gid,)).fetchone()
-                        return tenant if tenant and state and state['enabled'] else None
-                    except ValueError:pass
-            tenant=self._active_tenant()
-            if tenant:return tenant
-            self._no_active_group(query.get('from',{}).get('id'))
-            return None
-        msg = update.get('message') or update.get('edited_message')
-        if msg:
-            chat = msg.get('chat', {})
-            gid = chat.get('id')
-            if chat.get('type') != 'private' and gid not in self.managed_bots:
-                words=msg.get('text','').split()
-                return self if words and words[0].split('@')[0].lower() == '/group_add' else None
-            if chat.get('type') != 'private' and gid in self.managed_bots:
-                row = self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?', (gid,)).fetchone()
-                return self.managed_bots[gid] if row and row['enabled'] else None
-            if chat.get('type') == 'private':
-                words=msg.get('text','').split()
-                if words and words[0].split('@')[0].lower() == '/groups': return self
-                if words and words[0].split('@')[0].lower() == '/appeal':
-                    uid=msg.get('from',{}).get('id'); matches=[]
-                    if len(words)>1 and words[1].lstrip('-').isdigit():
-                        chosen=self.managed_bots.get(int(words[1]))
-                        if chosen:
-                            msg['text']='/appeal'+((' '+' '.join(words[2:])) if len(words)>2 else '')
-                            return chosen
-                    for tenant in self.managed_bots.values():
-                        if tenant.blacklisted(uid):matches.append(tenant)
-                    if len(matches)==1:return matches[0]
-                    if len(matches)>1:
-                        self.send(msg['chat']['id'],'你在多个管理群的黑名单中。请发送 /appeal 群ID 理由，群 ID 可向群管理员询问。')
-                        return None
-                tenant=self._active_tenant()
-                if tenant:return tenant
-                self._no_active_group(chat.get('id'))
-                return None
-        for key in ('chat_join_request','chat_member','my_chat_member'):
-            if key in update:
-                gid=update[key].get('chat',{}).get('id')
-                if gid in self.managed_bots:
-                    row=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(gid,)).fetchone()
-                    return self.managed_bots[gid] if row and row['enabled'] else None
-        return None
-
-    def _active_group(self):
-        row=self.db.execute("SELECT value FROM meta WHERE key='active_group'").fetchone()
-        return row[0] if row else self.group
-
-    def _active_tenant(self):
-        try: gid=int(self._active_group())
-        except (TypeError,ValueError): return None
-        state=self.db.execute('SELECT enabled FROM managed_groups WHERE chat=?',(gid,)).fetchone()
-        return self.managed_bots.get(gid) if state and state['enabled'] else None
-
-    def _no_active_group(self, uid):
-        if uid:
-            try:self.api.call('sendMessage',chat_id=uid,text='当前没有启用的管理群。群组管理员私聊发送 /groups 启用一个群。')
-            except Exception:pass
-
-    def _validate_tenant(self, tenant):
-        channel_member=tenant.call('getChatMember',chat_id=tenant.channel,user_id=self.bot_id)
+    def _validate_permissions(self):
+        bot = self
+        channel_member=bot.call('getChatMember',chat_id=bot.channel,user_id=self.bot_id)
         if channel_member.get('status') not in ('administrator','creator'):
-            raise RuntimeError(f'Bot must be administrator in channel {tenant.channel}')
-        member = tenant.call('getChatMember', chat_id=tenant.group, user_id=self.bot_id)
+            raise RuntimeError(f'Bot must be administrator in channel {bot.channel}')
+        member = bot.call('getChatMember', chat_id=bot.group, user_id=self.bot_id)
         if member.get('status') not in ('administrator','creator'):
-            raise RuntimeError(f'Bot must be administrator in group {tenant.group}')
+            raise RuntimeError(f'Bot must be administrator in group {bot.group}')
         if member.get('status') != 'creator':
             for right in ('can_delete_messages','can_restrict_members','can_invite_users'):
-                if not member.get(right): raise RuntimeError(f'Missing administrator right {right} in group {tenant.group}')
-        tenant.can_manage_tags = bool(member.get('status') == 'creator' or member.get('can_manage_tags'))
+                if not member.get(right): raise RuntimeError(f'Missing administrator right {right} in group {bot.group}')
+        bot.can_manage_tags = bool(member.get('status') == 'creator' or member.get('can_manage_tags'))
+
+    def accepts_update(self, update):
+        payload = update.get('message') or update.get('edited_message') or update.get('chat_member') or update.get('chat_join_request') or update.get('my_chat_member')
+        if payload:
+            chat = payload.get('chat', {})
+            return chat.get('type') == 'private' or chat.get('id') == self.group
+        query = update.get('callback_query')
+        if query:
+            chat = query.get('message', {}).get('chat', {})
+            return chat.get('id') == self.group or (chat.get('type') == 'private' and chat.get('id') == query.get('from', {}).get('id'))
+        return False
+
+    def maintenance(self):
+        if not hasattr(self, '_maintenance_due'):
+            self._maintenance_due = {}
+        tasks = [('verification', self.expire),
+                 ('deletions', self.sweep_deletions),
+                 ('jev', self.jev.work),
+                 ('attention', self.attention.tick), ('appeals', self.appeals.tick),
+                 ('milestones', self.milestones.tick)]
+        for name, fn in tasks:
+            if self._maintenance_due.get(name, 0) > time.time():
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                self._maintenance_due[name] = time.time() + max(30, getattr(exc, 'retry_after', 0))
+                LOG.warning('Maintenance deferred task=%s type=%s', name, type(exc).__name__)
+            else:
+                self._maintenance_due.pop(name, None)
 
     def run(self):
         me = self.call('getMe')
         self.username, self.bot_id = me['username'], me['id']
         if self.call('getWebhookInfo').get('url'):
             raise RuntimeError('Existing webhook configured; refusing to replace it')
-        self._init_group_manager()
-        for row in self.db.execute('SELECT chat,enabled FROM managed_groups').fetchall():
-            if row['enabled']:
-                tenant=self.managed_bots[row['chat']]
-                try:
-                    self._validate_tenant(tenant)
-                except Exception as exc:
-                    if tenant.group == self.group:
-                        raise
-                    with self.db:self.db.execute('UPDATE managed_groups SET enabled=0 WHERE chat=?',(tenant.group,))
-                    LOG.error('Disabled group=%s at startup: %s',tenant.group,exc)
-                    continue
-                if not tenant.can_manage_tags:
-                    LOG.warning('Bot lacks can_manage_tags in group=%s; member tag upgrades are disabled', tenant.group)
+        self.group_title = self.call('getChat', chat_id=self.group).get('title') or self.group_title
+        self._validate_permissions()
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO meta VALUES('start_time',?)", (str(int(time.time())),))
         start_time = int(self.db.execute("SELECT value FROM meta WHERE key='start_time'").fetchone()[0])
         row = self.db.execute("SELECT value FROM meta WHERE key='offset'").fetchone()
         offset = int(row[0]) if row else 0
-        LOG.info('Started @%s managed_groups=%s active_group=%s', self.username,
-                 sum(1 for r in self.db.execute('SELECT enabled FROM managed_groups') if r['enabled']), self._active_group())
+        LOG.info('Started @%s group=%s', self.username, self.group)
         while True:
             try:
-                enabled = [self.managed_bots[r['chat']] for r in self.db.execute('SELECT chat FROM managed_groups WHERE enabled=1').fetchall()]
-                for tenant in enabled:
-                    tenant.expire()
-                    tenant.ai.drain()
-                    tenant.sweep_deletions()
-                    tenant.history.prune()
-                    tenant.jev.work()
-                    tenant.attention.tick()
-                    tenant.appeals.tick()
-                    tenant.milestones.tick()
-                # Short polls while anything is queued so removals land near their deadline.
-                quick = any(bool(tenant.ai.futures) or tenant.jev.busy() or tenant.pending_deletions() for tenant in enabled)
+                self.maintenance()
+                quick = self.jev.busy() or self.pending_deletions()
                 updates = self.call('getUpdates', offset=offset, timeout=1 if quick else 20,
                                     allowed_updates=['message', 'edited_message', 'chat_member', 'chat_join_request', 'callback_query', 'my_chat_member'])
                 for update in updates:
                     payload = next((update[k] for k in ('edited_message','message','chat_member','chat_join_request','my_chat_member') if k in update), {})
                     event_time = payload.get('edit_date', payload.get('date', start_time))
-                    if event_time >= start_time and not self.db.execute('SELECT 1 FROM processed WHERE id=?', (update['update_id'],)).fetchone():
+                    if payload.get('chat', {}).get('type') == 'private':
+                        entry = (payload.get('text', '').split()[:1] or [''])[0].split('@')[0].lower()
+                        LOG.info('Private update=%s uid=%s entry=%s', update['update_id'], payload.get('from', {}).get('id'), entry if entry in ('/start','/help','/cancel') else 'other')
+                    if self.accepts_update(update) and event_time >= start_time and not self.db.execute('SELECT 1 FROM processed WHERE id=?', (update['update_id'],)).fetchone():
                         try:
                             if 'callback_query' in update and update['callback_query'].get('data','').startswith('gs:'):
                                 self.group_settings_callback(update['callback_query'])
-                            elif 'callback_query' in update and update['callback_query'].get('data','').startswith('pg:'):
-                                self.private_group_callback(update['callback_query'])
-                            elif 'callback_query' in update and update['callback_query'].get('data','').startswith('mg:'):
-                                self.group_manager_callback(update['callback_query'])
-                            elif ((update.get('message') or {}).get('chat',{}).get('type')=='private'
-                                  and ((update.get('message') or {}).get('text','').split()[:1] or [''])[0].split('@')[0].lower()=='/groups'):
-                                self.group_manager_command(update['message'])
                             elif 'message' in update and self.group_settings_reply(update['message']):
                                 pass
                             elif ((update.get('message') or {}).get('chat',{}).get('type')=='private'
@@ -2007,9 +1649,7 @@ class Bot:
                                   == '/settings'):
                                 self.group_settings_command(update['message'])
                             else:
-                                tenant=self._tenant_for_update(update)
-                                if tenant is not None:
-                                    tenant.handle(update)
+                                self.handle(update)
                         except APIError as exc:
                             if exc.code not in (400, 403):
                                 raise
@@ -2021,10 +1661,6 @@ class Bot:
                         self.db.execute('INSERT OR IGNORE INTO processed VALUES(?)', (update['update_id'],))
                         self.db.execute("INSERT OR REPLACE INTO meta VALUES('offset',?)", (str(offset),))
                     LOG.info('Processed update=%s', update['update_id'])
-                if len(updates)<100:
-                    self.attention.tick()
-                    self.appeals.tick()
-                    self.milestones.tick()
             except APIError as exc:
                 LOG.warning('%s', exc)
                 time.sleep(min(max(exc.retry_after, 3), 60))

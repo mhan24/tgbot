@@ -1,4 +1,4 @@
-"""Blacklist members after three completed check-in-only days."""
+"""Mute members after three completed check-in-only days."""
 from datetime import datetime,timedelta
 import logging
 import time
@@ -61,12 +61,21 @@ class Attention:
                 member=self.bot.call('getChatMember',chat_id=self.bot.group,user_id=uid)
                 if member['status'] not in ('member','restricted') or (member['status']=='restricted' and not member.get('is_member')):continue
                 if member.get('user',{}).get('is_bot'):continue
-                self.bot.blacklist_member(uid, reason=f'连续 3 天仅签到未发言：{lo}..{hi}')
-                self.bot.points.reset(uid)
+                # Group default mute length (MUTE_SECONDS); admins can unmute from /manage.
+                seconds=self.bot.mute_seconds
+                until=int(now)+seconds
+                self.bot.restrict(uid, until)
                 with self.db:
+                    self.db.execute('INSERT INTO warnings(uid,mute_until) VALUES(?,?) '
+                                    'ON CONFLICT(uid) DO UPDATE SET mute_until=excluded.mute_until',(uid, until))
+                    # Enforcement record: the same window never mutes the same member twice.
                     self.db.execute('INSERT OR REPLACE INTO attention_bans VALUES(?,?,?)',(uid,hi,int(now)))
-                    self.db.execute('DELETE FROM upgrades WHERE uid=?',(uid,))
-                self.bot.audit(0,uid,'attention_ban',f'{lo}..{hi}')
-                self.bot.send(self.bot.group,f'⚠️ <a href="tg://user?id={uid}">该成员</a> 连续 3 天仅签到未发言，已移出群并加入黑名单，积分已清零。')
+                self.bot.audit(0,uid,'attention_mute',f'{lo}..{hi}')
+                minutes=max(1,seconds//60)
+                if minutes>=1440 and minutes%1440==0: span=f'{minutes//1440} 天'
+                elif minutes>=60 and minutes%60==0: span=f'{minutes//60} 小时'
+                else: span=f'{minutes} 分钟'
+                self.bot.send(self.bot.group,f'⚠️ <a href="tg://user?id={uid}">该成员</a> 连续 3 天仅签到未发言，已禁言 {span}。',
+                              _delete_after=120 if self.bot.delete_after > 0 else 0)
             except Exception as exc:
-                LOG.warning('Attention ban failed uid=%s type=%s',uid,type(exc).__name__)
+                LOG.warning('Attention mute failed uid=%s type=%s',uid,type(exc).__name__)

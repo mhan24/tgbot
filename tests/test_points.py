@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -10,27 +11,137 @@ class Tests(unittest.TestCase):
     def setUp(self):
         self.db=sqlite3.connect(':memory:');self.db.row_factory=sqlite3.Row
         self.points=Points(self.db);self.user={'id':2,'first_name':'Alice'}
-    def test_checkin_once_and_range(self):
-        n,status=self.points.award(self.user,'checkin','a',100000)
-        self.assertIn(n,range(1,6));self.assertEqual(status,'added')
-        self.assertEqual(self.points.award(self.user,'checkin','b',100000),(0,'limit'))
-        self.assertEqual(self.points.award(self.user,'checkin','a',100000),(n,'replay'))
-        self.assertEqual(self.points.stats(2,100000)[0],n)
+        self.addCleanup(self.db.close)
+    def test_ten_pull_single_reward_and_replay(self):
+        with patch('points.secrets.randbelow', return_value=999999):
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                self.user, 'a', 100000)
+        self.assertEqual((amount, status), (1, 'added'))
+        self.assertEqual(results, [3] * 9 + [4])
+        self.assertEqual((pity4, pity5, guaranteed), (0, 10, 0))
+        self.assertEqual(self.points.checkin(self.user, 'a', 100000)[0:3], (1, 'replay', results))
+        self.assertEqual(self.points.award(self.user, 'checkin', 'b', 100000)[0:2], (0, 'limit'))
+        self.assertEqual(self.points.stats(2, 100000)[0], 1)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM checkin_draws').fetchone()[0], 1)
+
+    def test_five_star_standard_then_guaranteed_up(self):
+        rolls = [0, 999999] + [999999, 999999] * 9
+        with patch('points.secrets.randbelow', side_effect=rolls):
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                self.user, 'a', 100000)
+        self.assertEqual((amount, status), (5, 'added'))
+        self.assertEqual(results, [5] + [3] * 9)
+        self.assertEqual((pity4, pity5, guaranteed), (9, 9, 1))
+        self.assertFalse(self.points.checkin_notified('a', 'result'))
+        self.assertFalse(self.points.checkin_notified('a', 'broadcast'))
+        self.points.mark_checkin_notified('a', 'result')
+        self.points.mark_checkin_notified('a', 'broadcast')
+        self.assertTrue(self.points.checkin_notified('a', 'broadcast'))
+
+        rolls = [0, 999999] + [999999, 999999] * 9
+        with patch('points.secrets.randbelow', side_effect=rolls):
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                self.user, 'b', 100000 + 86400)
+        self.assertEqual((amount, status), (10, 'added'))
+        self.assertEqual(results[0], 6)
+        self.assertEqual((pity4, pity5, guaranteed), (9, 9, 0))
+
+    def test_five_star_hard_pity_and_four_star_carryover(self):
+        with self.db:
+            self.db.execute('INSERT INTO checkin_pity VALUES(2,0,89,1,1)')
+        with patch('points.secrets.randbelow', return_value=999999):
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                self.user, 'a', 100000)
+        self.assertEqual((amount, status), (10, 'added'))
+        self.assertEqual(results[0], 6)
+        self.assertEqual((pity4, pity5, guaranteed), (9, 9, 0))
+        with patch('points.secrets.randbelow', return_value=999999):
+            amount, status, results, pity4, pity5, guaranteed = self.points.checkin(
+                self.user, 'b', 100000 + 86400)
+        self.assertEqual((amount, status), (1, 'added'))
+        self.assertEqual(results, [4] + [3] * 9)
+        self.assertEqual((pity4, pity5, guaranteed), (9, 19, 0))
+
+    def test_multi_high_rarity_points_are_summed_and_capped(self):
+        cases = (
+            ([0, 0] + [999999, 0]*2 + [999999, 999999]*7, [6, 4, 4] + [3]*7, 12),
+            ([0, 999999, 999999, 0] + [999999, 999999]*8, [5, 4] + [3]*8, 6),
+            ([999999, 0]*2 + [999999, 999999]*8, [4, 4] + [3]*8, 2),
+            ([0, 0]*3, [6]*3 + [3]*7, 30),
+        )
+        for uid, (rolls, expected, amount) in enumerate(cases, 3):
+            with self.subTest(results=expected), patch('points.secrets.randbelow', side_effect=rolls):
+                actual = self.points.checkin({'id': uid}, str(uid), 100000)
+                self.assertEqual(actual[:3], (amount, 'added', expected))
+
     def test_message_cap_and_next_day(self):
         for i in range(10): self.points.award(self.user,'message',str(i),100000)
         self.assertEqual(self.points.stats(2,100000)[0],5)
         self.points.award(self.user,'message','newday',186400)
         self.assertEqual(self.points.stats(2,186400)[0],6)
         self.assertEqual(self.points.stats(2,186400)[2],1)
-    def test_configured_checkin_range_and_message_daily_points_cap(self):
-        points=Points(self.db,checkin_min=5,checkin_max=10,message_points=2,message_daily_limit=5)
-        with patch('points.secrets.randbelow',return_value=0):
-            self.assertEqual(points.award(self.user,'checkin','checkin',100000),(5,'added'))
+    def test_message_points_are_configurable(self):
+        points=Points(self.db,message_points=2,message_daily_limit=5)
         self.assertEqual(points.award(self.user,'message','m1',100000),(2,'added'))
         self.assertEqual(points.award(self.user,'message','m2',100000),(2,'added'))
         self.assertEqual(points.award(self.user,'message','m3',100000),(1,'added'))
         self.assertEqual(points.award(self.user,'message','m4',100000),(0,'limit'))
-        self.assertEqual(points.stats(2,100000)[:3],(10,5,5))
+        self.assertEqual(points.stats(2,100000)[:3],(5,0,5))
+
+    def test_checkin_broadcasts_only_five_star_tiers(self):
+        api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
+        bot.bot_id=99;bot.username='testbot'
+        def msg(mid,uid):
+            return {'chat':{'id':-1,'type':'supergroup'},'message_id':mid,
+                    'from':{'id':uid,'first_name':f'U{uid}'},'text':'/checkin'}
+        with patch('points.secrets.randbelow',return_value=999999):
+            bot.points_command(msg(1,2))
+        sends=[d.get('text','') for m,d in api.calls if m=='sendMessage']
+        self.assertTrue(any('十连签到成功' in text for text in sends))
+        self.assertTrue(any('四星 ×1' in text and '本次获得 1 积分' in text for text in sends))
+        self.assertFalse(any(text.startswith('🎉') for text in sends))
+        with patch('points.secrets.randbelow',side_effect=[0,999999]+[999999,999999]*9):
+            bot.points_command(msg(2,3))
+        sends=[d.get('text','') for m,d in api.calls if m=='sendMessage']
+        self.assertTrue(any('五星常驻' in text and 'tg://user?id=3' in text for text in sends))
+        with patch('points.secrets.randbelow',side_effect=[0,0]+[999999,999999]*9):
+            bot.points_command(msg(3,4))
+        sends=[d.get('text','') for m,d in api.calls if m=='sendMessage']
+        self.assertTrue(any('五星 UP' in text and 'tg://user?id=4' in text for text in sends))
+        self.assertEqual(bot.points.stats(2)[0],1)
+        self.assertEqual(bot.points.stats(3)[0],5)
+        self.assertEqual(bot.points.stats(4)[0],10)
+        with patch('points.secrets.randbelow',return_value=0):
+            bot.points_command(msg(4,5))
+        sends=[d.get('text','') for m,d in api.calls if m=='sendMessage']
+        self.assertTrue(any('三黄' in text and '五星 UP ×3' in text and 'tg://user?id=5' in text for text in sends))
+        self.assertEqual(bot.points.stats(5)[0],30)
+
+    def test_failed_broadcast_retries_without_duplicate_result(self):
+        api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
+        bot.bot_id=99;bot.username='testbot'
+        msg={'chat':{'id':-1,'type':'supergroup'},'message_id':1,
+             'from':{'id':2,'first_name':'Alice'},'text':'/checkin'}
+        original=bot.send
+        def flaky(chat,text,keep=False,**kwargs):
+            if text.startswith('🎉'):
+                raise RuntimeError('broadcast failed')
+            return original(chat,text,keep=keep,**kwargs)
+        bot.send=flaky
+        rolls=[0,999999]+[999999,999999]*9
+        with patch('points.secrets.randbelow',side_effect=rolls):
+            with self.assertRaises(RuntimeError):
+                bot.points_command(msg)
+        self.assertEqual(bot.points.stats(2)[0],5)
+        bot.send=original
+        rolls=[0,999999]+[999999,999999]*9
+        with patch('points.secrets.randbelow',side_effect=rolls):
+            bot.points_command(msg)
+        broadcasts=[d.get('text','') for m,d in api.calls if m=='sendMessage' and d.get('text','').startswith('🎉')]
+        results=[d.get('text','') for m,d in api.calls if m=='sendMessage' and '十连签到成功' in d.get('text','')]
+        self.assertEqual(len(broadcasts),1)
+        self.assertEqual(len(results),1)
+        self.assertEqual(bot.points.stats(2)[0],5)
     def test_beijing_midnight(self):
         before=datetime(2026,9,15,15,59,59,tzinfo=timezone.utc).timestamp()
         self.assertEqual(self.points.day(before),'2026-09-15')
@@ -56,10 +167,10 @@ class Tests(unittest.TestCase):
         bot.handle({'update_id':4,'message':msg(4,'/random')})
         bot.handle({'update_id':5,'message':msg(5,'bot',**{'from':{'id':5,'is_bot':True}})})
         self.assertEqual(bot.points.stats(2)[0],2)
-        with patch('points.secrets.randbelow',return_value=4):
+        with patch('points.secrets.randbelow',return_value=999999):
             bot.handle({'update_id':6,'message':msg(6,'/checkin')})
             bot.handle({'update_id':7,'message':msg(7,'/checkin')})
-        self.assertEqual(bot.points.stats(2)[0],7)
+        self.assertEqual(bot.points.stats(2)[0],3)
         bot.handle({'update_id':8,'message':msg(8,'/rank')})
         self.assertIn('私聊',[d for m,d in api.calls if m=='sendMessage'][-1]['text'])
     def test_group_rank_redirects_private_rank_is_complete(self):
@@ -84,12 +195,32 @@ class Tests(unittest.TestCase):
         bot.handle({'update_id':1,'message':{'chat':{'id':2,'type':'private'},'message_id':1,'from':self.user,'text':'/rank'}})
         self.assertIn('请先加入「-1」',[d for m,d in api.calls if m=='sendMessage'][-1]['text'])
 
-    def test_private_chat_redirects_other_points_commands(self):
+    def test_private_checkin_query_is_read_only_and_member_scoped(self):
         api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
         bot.bot_id=99;bot.username='testbot'
-        bot.handle({'update_id':1,'message':{'chat':{'id':2,'type':'private'},'message_id':1,'from':self.user,'text':'/checkin'}})
-        self.assertIn('私聊支持积分',[d for m,d in api.calls if m=='sendMessage'][-1]['text'])
-        self.assertEqual(bot.points.stats(2)[0],0)
+        for uid, results in ((2, [5,6]+[3]*8), (3, [6]*10)):
+            self.db.execute('INSERT INTO checkin_draws VALUES(?,?,?,?,?,?,?,?)',
+                            (str(uid), uid, '2026-01-01', json.dumps(results), 15, 1, 1, 1))
+        self.db.execute('INSERT INTO checkin_pity VALUES(2,4,20,1,1)')
+        self.db.commit()
+        # Reopening current storage preserves records without an upgrade path.
+        Points(self.db)
+        for mid, (uid, text, status, expected) in enumerate((
+            (2, '/checkin', 'member', ('累计抽数：10', '累计出金：2 次（五星 UP 1 次 · 常驻 1 次）',
+                                      '四星保底进度：4/10', '五星保底进度：20/90', '下次五星必为 UP：是')),
+            (4, '签到', 'member', ('累计出金：0 次', '0/90', '否（50/50）')),
+            (2, '签到', 'left', ('请先加入',)),
+        ), 1):
+            with self.subTest(uid=uid, text=text, status=status):
+                api.members[uid]={'status':status}
+                bot.handle({'update_id':mid, 'message':{'chat':{'id':uid,'type':'private'},
+                            'message_id':mid,'from':{'id':uid},'text':text}})
+                reply=[d for m,d in api.calls if m=='sendMessage'][-1]['text']
+                for fragment in expected:self.assertIn(fragment, reply)
+        self.assertEqual(self.points._pity(2), (4,20,1))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM checkin_draws').fetchone()[0], 2)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM point_events').fetchone()[0], 0)
+        self.assertEqual(self.points.stats(2)[0], 0)
 
     def test_pending_users_cannot_checkin(self):
         bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},FakeAPI(),self.db)
@@ -112,7 +243,7 @@ class Tests(unittest.TestCase):
         bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
         bot.points_command({'text':'/checkin','from':self.user,'message_id':11})
         self.assertEqual(bot.points.stats(2)[0],0)
-        self.assertFalse(any(m=='sendMessage' for m,d in api.calls))
+        self.assertIn('未加分、未计警告',[d['text'] for m,d in api.calls if m=='sendMessage'][-1])
         self.assertEqual(self.db.execute('SELECT count(*) FROM warnings').fetchone()[0],0)
 
     def test_hidden_avatar_checkin_visible_warning_once_per_message_and_mute(self):
@@ -137,17 +268,13 @@ class Tests(unittest.TestCase):
         bot.handle({'update_id':21,'message':msg})
         self.assertEqual(bot.points.stats(2)[0],1)
 
-    def test_successful_and_repeated_checkins_retained(self):
+    def test_checkin_source_retained_for_success_repeat_and_hidden_avatar(self):
         api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
-        bot.points_command({'text':'/checkin','from':self.user,'message_id':31})
-        bot.points_command({'text':'/checkin','from':self.user,'message_id':32})
-        deleted=[d['message_id'] for m,d in api.calls if m=='deleteMessage']
-        self.assertEqual(deleted,[])
-    def test_failed_avatar_checkin_retained(self):
-        api=FakeAPI();api.photos={'total_count':0,'photos':[]}
-        bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
-        bot.points_command({'text':'/checkin','from':self.user,'message_id':33})
-        self.assertFalse(any(m=='deleteMessage' for m,d in api.calls))
+        for mid, visible in ((31,True),(32,True),(33,False)):
+            with self.subTest(mid=mid, visible=visible):
+                api.photos={'total_count':int(visible),'photos':[[{'file_id':'visible'}]] if visible else []}
+                bot.points_command({'text':'/checkin','from':self.user,'message_id':mid})
+                self.assertFalse(any(m=='deleteMessage' for m,d in api.calls))
 
     def test_points_only_in_private_and_deep_link(self):
         api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
@@ -186,7 +313,7 @@ class Tests(unittest.TestCase):
 
         # Chinese check-in aliases enter the same validated path and still
         # retain the source message after replying.
-        bot.avatar_visible=lambda uid: True
+        bot.avatar_visible=lambda uid, **kwargs: True
         checkin={'chat':{'id':-1,'type':'supergroup'},'from':self.user,'message_id':54,'text':'签到'}
         self.assertTrue(bot.points_command(checkin))
         self.assertGreater(bot.points.stats(self.user['id'])[0],0)
@@ -207,8 +334,3 @@ class Tests(unittest.TestCase):
                 bot.points_command({'chat':chat,'from':self.user,'message_id':51,'text':cmd})
                 sent=next(i for i,(m,d) in enumerate(api.calls) if m=='sendMessage')
                 self.assertFalse(any(m == 'deleteMessage' for m, d in api.calls))
-    def test_checkin_source_retained_after_success_reply(self):
-        api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)
-        bot.points_command({'from':self.user,'message_id':52,'text':'/checkin'})
-        sent=max(i for i,(m,d) in enumerate(api.calls) if m=='sendMessage')
-        self.assertFalse(any(m == 'deleteMessage' for m, d in api.calls))

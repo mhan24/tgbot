@@ -4,12 +4,12 @@ import unittest
 from bot import Bot, APIError
 from test_bot import FakeAPI
 
-
 class Tests(unittest.TestCase):
     def setUp(self):
         self.api = FakeAPI()
         self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, sqlite3.connect(':memory:'))
         self.bot.bot_id, self.bot.username = 99, 'testbot'
+        self.addCleanup(self.bot.db.close)
 
     def panel(self, target=2, private=False):
         self.bot.command({'text': f'/manage {target}', 'from': {'id': 1},
@@ -31,29 +31,18 @@ class Tests(unittest.TestCase):
         self.click(row, 'warn'); self.click(row, 'warn')
         self.assertEqual(self.bot.db.execute('SELECT count FROM warnings WHERE uid=2').fetchone()[0], 1)
 
-    def test_cross_group_and_wrong_actor_cannot_warn(self):
+    def test_invalid_or_stale_panel_cannot_warn(self):
         row = self.panel()
-        for kwargs in ({'gid': -2}, {'actor': 2}, {'chat': -2}):
-            self.click(row, 'warn', **kwargs)
-        self.assertIsNone(self.bot.db.execute('SELECT 1 FROM warnings').fetchone())
-
-    def test_admin_rights_rechecked(self):
-        row = self.panel()
-        self.api.members[1] = {'status': 'member'}
-        self.click(row, 'warn')
-        self.assertIsNone(self.bot.db.execute('SELECT 1 FROM warnings').fetchone())
-
-    def test_promoted_target_protected(self):
-        row = self.panel()
-        self.api.members[2] = {'status': 'administrator'}
-        self.click(row, 'warn')
-        self.assertIsNone(self.bot.db.execute('SELECT 1 FROM warnings').fetchone())
-
-    def test_expired_panel(self):
-        row = self.panel()
-        self.bot.db.execute('UPDATE moderation_panels SET expires=0')
-        self.click(row, 'warn')
-        self.assertIsNone(self.bot.db.execute('SELECT 1 FROM warnings').fetchone())
+        for case, kwargs in (
+            ('group', {'gid':-2}), ('actor', {'actor':2}), ('chat', {'chat':-2}),
+            ('lost_admin', {}), ('promoted_target', {}), ('expired', {})):
+            with self.subTest(case=case):
+                self.api.members[1]={'status':'member' if case == 'lost_admin' else 'creator'}
+                self.api.members[2]={'status':'administrator' if case == 'promoted_target' else 'member'}
+                if case == 'expired':
+                    with self.bot.db:self.bot.db.execute('UPDATE moderation_panels SET expires=0')
+                self.click(row, 'warn', **kwargs)
+                self.assertIsNone(self.bot.db.execute('SELECT 1 FROM warnings').fetchone())
 
     def test_ban_needs_confirmation_removes_white_and_messages(self):
         self.bot.db.execute('INSERT INTO whitelist VALUES(2,0,1,?)', ('test',))
@@ -119,3 +108,44 @@ class Tests(unittest.TestCase):
         row = self.panel()
         due = self.bot.db.execute('SELECT due FROM deletions WHERE message_id=?', (row['message'],)).fetchone()[0]
         self.assertGreater(due, time.time() + 290)
+
+    def test_completed_ban_panel_replaces_stale_normal_status(self):
+        row=self.panel()
+        self.click(row,'confirm');self.click(row,'ban')
+        edits=[d for m,d in self.api.calls if m=='editMessageText' and d.get('message_id')==row['message']]
+        self.assertIn('状态：黑名单',edits[-1]['text'])
+        self.assertNotIn('确认拉黑？',edits[-1]['text'])
+        self.assertTrue(edits[-1]['reply_markup']['inline_keyboard'])
+
+    def test_operation_updates_same_card_and_rotates_token(self):
+        row=self.panel()
+        sends=sum(m=='sendMessage' for m,d in self.api.calls)
+        self.click(row,'resetwarn')
+        current=self.bot.db.execute('SELECT * FROM moderation_panels ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.assertEqual(current['message'],row['message'])
+        self.assertNotEqual(current['token'],row['token'])
+        # The existing action feedback is the only new message; no second panel.
+        self.assertEqual(sum(m=='sendMessage' for m,d in self.api.calls),sends+1)
+        self.click(row,'warn')
+        self.assertIsNone(self.bot.db.execute('SELECT * FROM warnings').fetchone())
+    def test_more_menu_keeps_optional_operations(self):
+        row=self.panel()
+        self.click(row,'more')
+        current=self.bot.db.execute('SELECT * FROM moderation_panels WHERE token=?',(row['token'],)).fetchone()
+        text,keyboard=self.bot.moderation.render(current)
+        labels=[b['text'] for line in keyboard for b in line]
+        self.assertIn('加入白名单',labels)
+        self.assertIn('返回',labels)
+
+    def test_bot_list_filters_departed_members_and_preserves_ownership(self):
+        self.bot.members.remember({'id':30,'is_bot':True,'first_name':'Helper','username':'example_bot'})
+        self.bot.members.remember({'id':31,'is_bot':True,'first_name':'Gone'})
+        self.api.members[30]={'status':'member','user':{'id':30,'is_bot':True}}
+        self.api.members[31]={'status':'left','user':{'id':31,'is_bot':True}}
+        self.bot.moderation.open(-1,1)
+        row=self.bot.db.execute('SELECT * FROM moderation_panels ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.click(row,'bots0',actor=2)
+        self.assertFalse(any(m=='editMessageText' for m,d in self.api.calls))
+        self.click(row,'bots0')
+        text=[d['text'] for m,d in self.api.calls if m=='editMessageText'][-1]
+        self.assertIn('Helper',text);self.assertNotIn('Gone',text)
