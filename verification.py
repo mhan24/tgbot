@@ -53,47 +53,22 @@ class Verification:
           chat INTEGER, message_id INTEGER, uid INTEGER, nonce TEXT, expires INTEGER,
           PRIMARY KEY(chat, message_id));
         ''')
-        self.migrate()
+        self.require_schema()
 
-    # 旧库只有 uid/chat/kind/nonce/answer/expires/attempts/passed；缺列在这里补齐。
-    ADDED_COLUMNS = {
-        'question': "TEXT NOT NULL DEFAULT ''",
-        'options': "TEXT NOT NULL DEFAULT '[]'",
-        'state': "TEXT NOT NULL DEFAULT 'challenge'",
-        'sent': 'INTEGER NOT NULL DEFAULT 0',
-        'send_attempts': 'INTEGER NOT NULL DEFAULT 0',
-        'restored': 'INTEGER NOT NULL DEFAULT 0',
-        'restore_attempts': 'INTEGER NOT NULL DEFAULT 0',
-        'retry_at': 'INTEGER NOT NULL DEFAULT 0',
-        'updated': 'INTEGER NOT NULL DEFAULT 0',
-    }
+    REQUIRED_COLUMNS = frozenset({
+        'uid', 'chat', 'kind', 'nonce', 'question', 'answer', 'options', 'expires',
+        'attempts', 'state', 'sent', 'send_attempts', 'restored', 'restore_attempts',
+        'retry_at', 'updated'})
 
-    def migrate(self):
-        """在旧库上补齐列并保留仍有效的通过状态；旧的进行中验证无法重建题目。"""
+    def require_schema(self):
+        """不接受其他版本的验证表：没有迁移分支，结构不符时直接拒绝启动。"""
         columns = {row['name'] for row in self.db.execute('PRAGMA table_info(verification)')}
-        missing = {name: definition for name, definition in self.ADDED_COLUMNS.items()
-                   if name not in columns}
-        if not missing:
-            return
-        stale_cards = []
-        with self.db:
-            for name, definition in missing.items():
-                self.db.execute(f'ALTER TABLE verification ADD COLUMN {name} {definition}')
-            if 'passed' in columns:
-                now = int(time.time())
-                # 旧记录没有保存题目，进行中的验证只能作废，让申请人重新申请。
-                self.db.execute('DELETE FROM verification WHERE COALESCE(passed,0)=0')
-                self.db.execute("UPDATE verification SET state='passed' WHERE passed=1 AND expires>?",
-                                (now,))
-                self.db.execute("DELETE FROM verification WHERE state!='passed' OR expires<=?",
-                                (now,))
-                stale_cards = self.db.execute(
-                    'SELECT chat,message_id FROM verification_prompts').fetchall()
-                self.db.execute('DELETE FROM verification_prompts')
-        for card in stale_cards:
-            # 旧卡片按钮已失效，按群常规时长清理，不在群里留下无法点击的验证题。
-            self.bot.schedule_delete(card['chat'], card['message_id'])
-        LOG.info('Verification table migrated from the previous schema')
+        missing = self.REQUIRED_COLUMNS - columns
+        if missing:
+            raise RuntimeError(
+                'verification table has an incompatible schema; missing columns: '
+                + ', '.join(sorted(missing))
+                + '. Drop verification and verification_prompts, then restart.')
 
     # --- 入口 -------------------------------------------------------------
 

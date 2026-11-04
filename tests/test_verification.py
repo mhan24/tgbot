@@ -379,60 +379,34 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(len(self.api.texts()), 1)
         self.assertEqual(len(self.buttons()), 5)
 
-class MigrationTests(unittest.TestCase):
-    """旧版 verification 表（passed/expires 结构）在新代码下可直接使用。"""
+class SchemaTests(unittest.TestCase):
+    """不做迁移、不做兼容：旧结构直接拒绝启动，新库按当前结构创建。"""
 
     OLD_SCHEMA = """
     CREATE TABLE verification(uid INTEGER PRIMARY KEY, chat INTEGER, kind TEXT,
       nonce TEXT, answer INTEGER, expires INTEGER, attempts INTEGER DEFAULT 0,
       passed INTEGER DEFAULT 0);
-    CREATE TABLE verification_prompts(chat INTEGER, message_id INTEGER, uid INTEGER,
-      nonce TEXT, expires INTEGER, PRIMARY KEY(chat, message_id));
     """
 
-    def setUp(self):
-        self.api = FakeAPI()
-        self.db = sqlite3.connect(':memory:')
-        self.addCleanup(self.db.close)
-        self.db.executescript(self.OLD_SCHEMA)
-        now = int(time.time())
-        with self.db:
-            # 进行中的旧验证与已通过的旧验证；均为虚构数据。
-            self.db.execute("INSERT INTO verification VALUES(2,-1,'request','old1',7,?,1,0)",
-                            (now + 200,))
-            self.db.execute("INSERT INTO verification VALUES(3,-1,'approved','old2',9,?,0,1)",
-                            (now + 86400,))
-            self.db.execute("INSERT INTO verification_prompts VALUES(-1,11,2,'old1',?)",
-                            (now + 200,))
-        self.bot = Bot(dict(CFG), self.api, self.db)
-        self.bot.bot_id = 99
-        self.bot.username = 'testbot'
+    def test_previous_schema_is_rejected_instead_of_migrated(self):
+        db = sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        db.executescript(self.OLD_SCHEMA)
+        with self.assertRaises(RuntimeError) as caught:
+            Bot(dict(CFG), FakeAPI(), db)
+        self.assertIn('incompatible schema', str(caught.exception))
+        self.assertIn('Drop verification', str(caught.exception))
+        columns = {row[1] for row in db.execute('PRAGMA table_info(verification)')}
+        self.assertEqual(columns, {'uid', 'chat', 'kind', 'nonce', 'answer', 'expires',
+                                   'attempts', 'passed'})
 
-    def test_columns_are_added_and_inflight_challenges_are_dropped(self):
-        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(verification)')}
-        self.assertTrue({'question', 'options', 'state', 'sent', 'send_attempts',
-                         'restored', 'restore_attempts', 'retry_at', 'updated'} <= columns)
-        self.assertIsNone(self.db.execute('SELECT 1 FROM verification WHERE uid=2').fetchone())
-        # 旧的进行中卡片按群常规时长清理。
-        queued = {row['message_id']: row['due'] for row in
-                  self.db.execute('SELECT * FROM deletions')}
-        self.assertIn(11, queued)
-
-    def test_verified_state_survives_and_new_challenges_still_work(self):
-        row = self.db.execute('SELECT state,expires FROM verification WHERE uid=3').fetchone()
-        self.assertEqual(row['state'], 'passed')
-        self.bot.handle({'update_id': 9, 'chat_member': {
-            'chat': {'id': -1}, 'from': {'id': 500},
-            'old_chat_member': {'user': {'id': 3}, 'status': 'left'},
-            'new_chat_member': {'user': {'id': 3, 'first_name': 'C'}, 'status': 'member'}}})
-        self.assertFalse([m for m in self.api.methods()
-                          if m in ('sendMessage', 'restrictChatMember')])
-        self.bot.handle({'update_id': 10, 'chat_join_request': {
-            'chat': {'id': -1}, 'from': {'id': 2, 'first_name': 'A'}, 'user_chat_id': 2}})
-        fresh = self.db.execute('SELECT * FROM verification WHERE uid=2').fetchone()
-        self.assertEqual(fresh['state'], 'challenge')
-        self.assertTrue(fresh['options'])
-        self.assertIn('+', fresh['question'])
+    def test_fresh_database_creates_the_current_schema(self):
+        db = sqlite3.connect(':memory:')
+        self.addCleanup(db.close)
+        api = FakeAPI()
+        bot = Bot(dict(CFG), api, db)
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(verification)')}
+        self.assertEqual(columns, set(bot.verification.REQUIRED_COLUMNS))
 
 
 if __name__ == '__main__':

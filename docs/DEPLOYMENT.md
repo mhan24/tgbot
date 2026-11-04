@@ -65,7 +65,23 @@ journalctl -u tgbot -n 50 --no-pager
 
 菜单文案变化后运行 `python3 scripts/update_commands.py`（只更新已有菜单，不发送群消息），再用 Telegram 客户端确认命令菜单只剩 `/start`、`/help`。
 
-## 5. 备份与恢复
+## 5. 从旧版本升级（破坏性，无迁移）
+
+本版本不做数据迁移：验证表结构变化后不会自动改表。升级时先停服并重建验证表：
+
+```sh
+systemctl stop tgbot
+sqlite3 /var/lib/tgbot/bot.sqlite3 \
+  'DROP TABLE IF EXISTS verification; DROP TABLE IF EXISTS verification_prompts;'
+# 上传新代码后
+systemctl start tgbot
+```
+
+- 旧验证记录、进行中的验证和旧验证卡片记录会被清空；进行中的申请人需要重新申请。
+- 旧版积分、签到、举报等表不读取也不自动删除；要彻底重置需另行授权后手工 `DROP TABLE`。
+- 结构不匹配时服务会启动失败并报 `verification table has an incompatible schema`，按上面步骤重建表即可。
+
+## 6. 备份与恢复
 
 ```sh
 systemctl stop tgbot
@@ -75,7 +91,7 @@ systemctl start tgbot
 
 或使用 SQLite backup API 在线备份。`.env` 与数据库分开存放；备份文件不提交到 Git。
 
-## 6. 排查
+## 7. 排查
 
 | 现象 | 排查方向 |
 |---|---|
@@ -86,5 +102,6 @@ systemctl start tgbot
 | 验证卡片没有清理 | `DELETE_AFTER_SECONDS=0` 关闭了清理；恢复为非 0 后重启 |
 | 日志出现 `Verification conclusion deferred` | 机器人缺少限制/邀请权限或 Telegram 暂时失败；记录保留并每 30 秒重试 |
 | 日志出现 `Restore permissions failed` | 恢复发言失败，后台最多重试 5 次；仍未成功时在 Telegram 手动解除限制 |
+| 启动报 `verification table has an incompatible schema` | 数据库仍是旧结构；按第 5 节删除验证相关表后重启，不做自动迁移 |
 
 日志只记录动作、标识和错误码，不记录 token、完整请求头或消息原文。

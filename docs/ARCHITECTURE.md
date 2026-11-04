@@ -41,7 +41,9 @@ Telegram getUpdates
 | `verification` | 每人一行验证状态：题型、题目、答案、随机串、有效期、答错次数、`state`、投递与恢复重试字段 |
 | `verification_prompts` | 群内验证卡片的消息 ID，与验证随机串绑定，结束后转入删除队列 |
 
-数据库采用 WAL。备份应使用 SQLite backup API 或停服后完整复制，避免只复制正在写入的主文件。旧版遗留表（积分、签到、举报等）不再创建、不再读取，也不在本阶段删除；需要清理时另行授权。
+数据库采用 WAL。备份应使用 SQLite backup API 或停服后完整复制，避免只复制正在写入的主文件。
+
+**不做迁移、不做兼容**：初始化只创建当前完整结构，代码里没有 `ALTER TABLE`、旧字段读取或数据搬迁分支。如果现有 `verification` 表结构与 `Verification.REQUIRED_COLUMNS` 不一致，构造 `Bot` 会直接抛 `RuntimeError` 并提示删除 `verification`、`verification_prompts` 后重启——不会静默改表，也不会尝试兼容旧行。旧版其他遗留表（积分、签到、举报等）不再创建、不再读取，也不由代码删除。
 
 ## 状态与重试
 
