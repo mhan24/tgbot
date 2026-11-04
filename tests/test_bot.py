@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from bot import Bot, DEFAULT_VERIFY_SECONDS, config
-from telegram import API, APIError
+from botapi import API, APIError
 
 
 class FakeAPI:
@@ -220,6 +220,24 @@ class CoreTests(unittest.TestCase):
                 self.addCleanup(bot.db.close)
                 self.assertEqual(bot.channel_url, expected)
 
+    def test_processed_ids_are_pruned_to_a_bounded_window(self):
+        with self.bot.db:
+            self.bot.db.executemany('INSERT INTO processed(id) VALUES(?)',
+                                    [(i,) for i in range(1, self.bot.PROCESSED_LIMIT + 42)])
+        self.bot.prune_processed()
+        kept = [row[0] for row in self.bot.db.execute('SELECT id FROM processed ORDER BY id')]
+        self.assertEqual(len(kept), self.bot.PROCESSED_LIMIT)
+        self.assertEqual(kept[-1], self.bot.PROCESSED_LIMIT + 41)
+
+    def test_join_request_without_user_chat_id_falls_back_to_the_user(self):
+        self.bot.handle({'update_id': 1, 'chat_join_request': {
+            'chat': {'id': -1, 'type': 'supergroup'},
+            'from': {'id': 2, 'first_name': 'A'}}})
+        card = [data for method, data in self.api.calls if method == 'sendMessage'][-1]
+        self.assertEqual(card['chat_id'], 2)
+        self.assertIsNotNone(self.bot.db.execute(
+            'SELECT 1 FROM verification WHERE uid=2').fetchone())
+
     def test_maintenance_isolates_task_failures_with_cooldown(self):
         seen = []
 
@@ -245,7 +263,7 @@ class TransportTests(unittest.TestCase):
     def test_invalid_payload_is_retryable_and_hides_token(self):
         for payload in (b'invalid', b'[]', b'{"ok":true}'):
             with self.subTest(payload=payload), \
-                    patch('telegram.urllib.request.urlopen', return_value=io.BytesIO(payload)):
+                    patch('botapi.urllib.request.urlopen', return_value=io.BytesIO(payload)):
                 with self.assertRaises(APIError) as caught:
                     API('fake-token').call('getMe')
                 self.assertEqual(caught.exception.code, 503)
@@ -253,7 +271,7 @@ class TransportTests(unittest.TestCase):
 
     def test_valid_payload_is_returned(self):
         payload = json.dumps({'ok': True, 'result': {'id': 99}}).encode()
-        with patch('telegram.urllib.request.urlopen', return_value=io.BytesIO(payload)):
+        with patch('botapi.urllib.request.urlopen', return_value=io.BytesIO(payload)):
             self.assertEqual(API('fake-token').call('getMe'), {'id': 99})
 
     def test_permanent_flag_follows_error_code(self):

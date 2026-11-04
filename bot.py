@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 from retention import NOTICE_SECONDS
-from telegram import API, APIError
+from botapi import API, APIError
 from verification import MAX_ATTEMPTS, Verification
 
 LOG = logging.getLogger('groupbot')
@@ -236,7 +236,9 @@ class Bot:
         if 'chat_join_request' in update:
             request = update['chat_join_request']
             if (request.get('chat') or {}).get('id') == self.group:
-                self.verification.admit(request.get('from'), 'request', request.get('user_chat_id'))
+                user = request.get('from') or {}
+                self.verification.admit(user, 'request',
+                                        request.get('user_chat_id') or user.get('id'))
             return
         if 'chat_member' in update:
             self.member_update(update['chat_member'])
@@ -329,21 +331,33 @@ class Bot:
 
     # --- 主循环 -----------------------------------------------------------
 
+    # 每个后台任务的最短间隔；失败后统一冷却 30 秒起。
+    MAINTENANCE_TASKS = (('verification', 0), ('deletions', 0), ('processed', 600))
+    PROCESSED_LIMIT = 5000
+
     def maintenance(self):
-        if not hasattr(self, '_maintenance_due'):
-            self._maintenance_due = {}
-        tasks = [('verification', self.verification.tick), ('deletions', self.sweep_deletions)]
+        next_run = getattr(self, '_next_run', {})
+        actions = {'verification': self.verification.tick,
+                   'deletions': self.sweep_deletions,
+                   'processed': self.prune_processed}
         now = time.time()
-        for name, action in tasks:
-            if self._maintenance_due.get(name, 0) > now:
+        for name, interval in self.MAINTENANCE_TASKS:
+            if next_run.get(name, 0) > now:
                 continue
             try:
-                action()
+                actions[name]()
             except Exception as exc:
-                self._maintenance_due[name] = time.time() + max(30, getattr(exc, 'retry_after', 0))
+                next_run[name] = time.time() + max(30, getattr(exc, 'retry_after', 0))
                 LOG.warning('Maintenance deferred task=%s type=%s', name, type(exc).__name__)
             else:
-                self._maintenance_due.pop(name, None)
+                next_run[name] = time.time() + interval
+        self._next_run = next_run
+
+    def prune_processed(self):
+        """只保留最近的更新 ID：处理位置已经前移，旧 ID 不会被重新投递。"""
+        with self.db:
+            self.db.execute('DELETE FROM processed WHERE id <= (SELECT max(id) - ? FROM processed)',
+                            (self.PROCESSED_LIMIT,))
 
     def validate_permissions(self):
         channel_member = self.call('getChatMember', chat_id=self.channel, user_id=self.bot_id)
@@ -396,7 +410,11 @@ class Bot:
                         self.db.execute('INSERT OR IGNORE INTO processed VALUES(?)', (update['update_id'],))
                         self.db.execute("INSERT OR REPLACE INTO meta VALUES('offset',?)", (str(offset),))
             except APIError as exc:
-                LOG.warning('Polling failed code=%s retry_after=%s', exc.code, exc.retry_after)
+                if exc.code == 409:
+                    # 同一个 token 被两个进程轮询时 Telegram 返回 409。
+                    LOG.error('Polling conflict: another instance is polling this token')
+                else:
+                    LOG.warning('Polling failed code=%s retry_after=%s', exc.code, exc.retry_after)
                 time.sleep(min(max(exc.retry_after, 3), 60))
             except Exception:
                 LOG.exception('Update failed; will retry')

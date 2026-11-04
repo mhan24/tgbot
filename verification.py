@@ -10,7 +10,7 @@ import logging
 import secrets
 import time
 
-from telegram import APIError
+from botapi import APIError
 
 LOG = logging.getLogger('groupbot.verification')
 
@@ -172,11 +172,18 @@ class Verification:
                     self.bot.audit(0, uid, 'verification_approve_failed')
                     self._answer(query, '验证已通过，但入群申请已失效，请重新申请入群。')
                     return
-        else:
-            self._restore(uid)
+            self.bot.audit(0, uid, 'verified')
+            self._answer(query, '验证成功，欢迎入群！')
+            self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+            return
         self.bot.audit(0, uid, 'verified')
-        self._answer(query, '验证成功，欢迎入群！')
-        self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+        if self._restore(uid):
+            self._answer(query, '验证成功，欢迎入群！')
+            self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+        else:
+            # 验证本身通过，但发言权限没恢复：不谎报“成功”，交给后台重试。
+            self._answer(query, '验证已通过，但恢复发言失败；机器人会自动重试，仍无法发言请联系管理员。')
+            self._edit_card(query, '✅ 已通过验证，恢复发言失败，正在自动重试。')
 
     # --- 后台维护 ---------------------------------------------------------
 
@@ -194,10 +201,10 @@ class Verification:
             else:
                 self._deliver(row)
         for row in self.db.execute(
-                "SELECT uid FROM verification WHERE state='passed' AND restored=0 "
+                "SELECT uid,restore_attempts FROM verification WHERE state='passed' AND restored=0 "
                 "AND restore_attempts<? AND retry_at<=?",
                 (RESTORE_ATTEMPTS, now)).fetchall():
-            self._restore(row['uid'])
+            self._restore(row['uid'], row['restore_attempts'])
         with self.db:
             self.db.execute("DELETE FROM verification WHERE state='passed' AND expires<?", (now,))
 
@@ -250,8 +257,12 @@ class Verification:
                                 (row['chat'], int(sent['message_id']), uid, row['nonce'], row['expires']))
 
     def _fail(self, row, reason):
-        """结束一个未通过的验证：拒绝申请或移出成员；失败时保留状态重试。"""
+        """结束一个未通过的验证：拒绝申请或移出成员；失败时标记过期并重试。"""
         uid = row['uid']
+        with self.db:
+            # 先标记失效：即使随后的 Telegram 调用失败，后台也会按超时继续收尾。
+            self.db.execute('UPDATE verification SET expires=0, updated=? WHERE uid=?',
+                            (int(time.time()), uid))
         method = 'declineChatJoinRequest' if row['kind'] == 'request' else 'unbanChatMember'
         payload = {'chat_id': self.bot.group, 'user_id': uid}
         if method == 'unbanChatMember':
@@ -270,14 +281,19 @@ class Verification:
             self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
         self.bot.audit(0, uid, f'verification_{reason}')
 
-    def _restore(self, uid):
+    def _restore(self, uid, attempts=0):
         try:
             self.bot.restore(uid)
         except APIError as exc:
+            attempts += 1
             with self.db:
-                self.db.execute('UPDATE verification SET restore_attempts=restore_attempts+1,retry_at=? '
-                                'WHERE uid=?', (int(time.time()) + FINISH_RETRY_SECONDS, uid))
-            LOG.warning('Restore permissions failed uid=%s code=%s', uid, exc.code)
+                self.db.execute('UPDATE verification SET restore_attempts=?, retry_at=? WHERE uid=?',
+                                (attempts, int(time.time()) + FINISH_RETRY_SECONDS, uid))
+            LOG.warning('Restore permissions failed uid=%s code=%s attempts=%s',
+                        uid, exc.code, attempts)
+            if attempts >= RESTORE_ATTEMPTS:
+                # 达到上限后不再重试：成员仍被限制，留下审计供人工解除。
+                self.bot.audit(0, uid, 'verification_restore_gaveup')
             return False
         with self.db:
             self.db.execute('UPDATE verification SET restored=1, retry_at=0 WHERE uid=?', (uid,))
@@ -333,8 +349,11 @@ class Verification:
         return {'inline_keyboard': rows}
 
     def _answer(self, query, text):
+        callback_id = query.get('id')
+        if not callback_id:
+            return
         try:
-            self.bot.call('answerCallbackQuery', callback_query_id=query['id'], text=text, show_alert=True)
+            self.bot.call('answerCallbackQuery', callback_query_id=callback_id, text=text, show_alert=True)
         except APIError as exc:
             LOG.info('Callback acknowledgement failed code=%s', exc.code)
 

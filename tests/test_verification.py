@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from bot import Bot
-from telegram import APIError
+from botapi import APIError
 from test_bot import FakeAPI
 
 CFG = {'GROUP_ID': '-1', 'CHANNEL_ID': '-2', 'VERIFY_SECONDS': '240',
@@ -326,6 +326,62 @@ class VerificationTests(unittest.TestCase):
         with patch('bot.time.time', return_value=self.row()['retry_at']):
             self.bot.verification.tick()
         self.assertEqual(self.row()['restored'], 1)
+
+    def test_restore_failure_is_reported_honestly(self):
+        self.join(2)
+        row = self.row()
+        original = self.api.call
+
+        def fail_restore(method, **data):
+            if method == 'restrictChatMember':
+                raise APIError(method, {'error_code': 500, 'description': 'boom'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=fail_restore):
+            self.click(row)
+        self.assertEqual(self.row()['state'], 'passed')
+        alert = self.alerts()[-1]
+        self.assertIn('恢复发言失败', alert)
+        self.assertNotIn('验证成功，欢迎入群', alert)
+        edited = [data['text'] for method, data in self.api.calls if method == 'editMessageText'][-1]
+        self.assertIn('正在自动重试', edited)
+
+    def test_failed_conclusion_keeps_the_challenge_due(self):
+        row = self.request()
+        original = self.api.call
+
+        def forbidden(method, **data):
+            if method == 'declineChatJoinRequest':
+                raise APIError(method, {'error_code': 403, 'description': 'not enough rights'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=forbidden):
+            with patch('bot.time.time', return_value=row['expires'] + 1):
+                self.bot.verification.tick()
+        # 收尾失败也要标记失效，避免答错次数被无限累加。
+        self.assertEqual(self.row()['expires'], 0)
+        self.click(self.row())
+        self.assertIn('已失效', self.alerts()[-1])
+
+    def test_giving_up_on_permission_restore_is_audited(self):
+        self.join(2)
+        row = self.row()
+        original = self.api.call
+
+        def always_fails(method, **data):
+            if method == 'restrictChatMember':
+                raise APIError(method, {'error_code': 500, 'description': 'boom'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=always_fails):
+            self.click(row)
+            for _ in range(6):
+                with patch('bot.time.time', return_value=self.row()['retry_at']):
+                    self.bot.verification.tick()
+        self.assertEqual(self.row()['restored'], 0)
+        self.assertEqual(self.row()['restore_attempts'], 5)
+        self.assertTrue(self.bot.db.execute(
+            "SELECT 1 FROM audit WHERE action='verification_restore_gaveup'").fetchone())
 
     # --- 卡片清理 ---------------------------------------------------------
 

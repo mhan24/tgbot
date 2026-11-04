@@ -109,7 +109,8 @@ systemctl start tgbot
 | 直接进群的成员无法发言 | 正在等待验证；答对后自动恢复，超时会被移出 |
 | 验证卡片没有清理 | `DELETE_AFTER_SECONDS=0` 关闭了清理；恢复为非 0 后重启 |
 | 日志出现 `Verification conclusion deferred` | 机器人缺少限制/邀请权限或 Telegram 暂时失败；记录保留并每 30 秒重试 |
-| 日志出现 `Restore permissions failed` | 恢复发言失败，后台最多重试 5 次；仍未成功时在 Telegram 手动解除限制 |
+| 日志出现 `Restore permissions failed` | 恢复发言失败，后台每 30 秒重试，最多 5 次；随后写 `verification_restore_gaveup` 审计并停止，需在 Telegram 手动解除限制 |
+| 日志出现 `Polling conflict` | 有另一个进程用同一 token 在轮询（Telegram 返回 409）；停掉多余实例 |
 | 启动报 `verification table has an incompatible schema` | 数据库仍是旧结构；按第 5 节删除验证相关表后重启，不做自动迁移 |
 
 日志只记录动作、标识和错误码，不记录 token、完整请求头或消息原文。

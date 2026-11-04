@@ -8,7 +8,7 @@
 |---|---|
 | `bot.py` | 配置读取、Telegram 调用封装、单群过滤、消息删除队列、更新分发、`/start`、`/help`、权限与成员状态、长轮询主循环 |
 | `verification.py` | 验证状态机：发题、判题、批准或拒绝、超时与答错处理、投递和恢复重试、卡片登记 |
-| `telegram.py` | Bot API 传输层：请求、响应解析、`APIError`（`code`、`description`、`retry_after`、`permanent`） |
+| `botapi.py` | Bot API 传输层：请求、响应解析、`APIError`（`code`、`description`、`retry_after`、`permanent`） |
 | `retention.py` | 失败与处罚通知的显式保留时长常量 |
 | `scripts/command_descriptions.json` | 菜单里保留的英文命令及中文说明 |
 | `scripts/update_commands.py` | 刷新已有菜单说明，移除不在命令表里的条目 |
@@ -48,9 +48,9 @@ Telegram getUpdates
 
 - 验证卡片发送失败：非永久错误每 30 秒重试，最多 3 次；永久错误（400/403）或次数用尽则结束验证并按失败处理（拒绝申请或保留禁言）。
 - 拒绝申请、移出成员失败：若不是“用户已不存在”“申请已撤销”这类已终结错误，保留记录并每 30 秒重试；权限恢复后自动完成。
-- 恢复发言失败：保留通过状态，后台每 30 秒重试，最多 5 次。
+- 恢复发言失败：保留通过状态，后台每 30 秒重试，最多 5 次；达到上限后停止并写 `verification_restore_gaveup` 审计。
 - 删除消息失败：400/403 直接放弃；429 按 `retry_after` 延后；其他错误重试 2 次后放弃并写审计。
-- 维护任务分别捕获异常并冷却 30 秒重试，单项失败不影响其他任务。
+- 维护任务分别捕获异常并冷却 30 秒重试，单项失败不影响其他任务；`processed` 只保留最近 5000 个更新 ID（每 10 分钟修剪），避免表无限增长。
 - 通过状态先落库再调用 `approveChatJoinRequest`，保证伴随入群更新不会重复发题。
 
 Telegram 与 SQLite 无法构成同一事务，因此代码保存可恢复状态、区分“业务未执行”和“已执行但消息未送达”，不承诺外部调用严格只执行一次。

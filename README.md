@@ -46,7 +46,7 @@ python3 bot.py
 
 - [bot.py](bot.py)：配置、Telegram 调用、单群过滤、消息生命周期、更新分发与长轮询。
 - [verification.py](verification.py)：验证状态机（发题、判题、通过、超时/答错拒绝、投递与恢复重试）。
-- [telegram.py](telegram.py)：Bot API 传输层，区分可重试与永久失败。
+- [botapi.py](botapi.py)：Bot API 传输层，区分可重试与永久失败。
 - [retention.py](retention.py)：失败与处罚通知的显式保留时长。
 - [scripts](scripts)：命令菜单说明维护；[tests](tests)：使用模拟 Telegram 与内存 SQLite 的回归测试。
 

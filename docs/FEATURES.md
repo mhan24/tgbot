@@ -53,7 +53,7 @@
 - 用户命令、私聊来信和验证卡片本身不做删除，只有机器人发出的群消息和已结束的卡片进入清理队列。
 - 其他 Bot 发到本群的可见消息按群常规时长清理；频道身份发言不清理也不处理。
 - 私聊消息不自动删除。
-- 失败与提示信息显式使用 120 秒（`Bot.notice_seconds()`），不按文案关键词猜类别。
+- 群内失败提示（例如未知命令）显式使用 120 秒（`Bot.notice_seconds()`），不按文案关键词猜类别；验证过程中的提示通过按钮弹窗回答，不额外发群消息。
 
 详细规则见 [消息保留规范](MESSAGE_RETENTION.md)。
 
@@ -69,10 +69,10 @@
 | 私聊无法发起（用户未与机器人互动） | 直接拒绝申请并记录审计 |
 | 拒绝申请或移出成员时权限不足 | 保留记录，每 30 秒重试；权限恢复后继续 |
 | 申请已过期或被撤销 | 清除本地记录，提示用户重新申请 |
-| 恢复发言权限失败 | 保留通过状态并每 30 秒重试，最多 5 次 |
+| 恢复发言权限失败 | 保留通过状态并每 30 秒重试，最多 5 次；仍未成功则停止重试并写 `verification_restore_gaveup` 审计，成员需人工解除限制 |
 | 禁言失败（无法限制新成员） | 不发验证卡片，记录 `verification_restrict_failed` 审计 |
 
-Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`reject_bot`、`allow_invited_bot`、`verification_approve_failed` 等动作。
+Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`verification_restrict_failed`、`verification_approve_failed`、`verification_restore_gaveup`、`reject_bot`、`allow_invited_bot`、`delete_giveup`、`update_failed` 等动作。
 
 ## 6. 限制
 
