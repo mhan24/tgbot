@@ -1,10 +1,10 @@
 # 配置、部署与维护
 
-核对日期：2026-11-04。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。当前版本只包含入群验证功能。
+核对日期：2026-11-04。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。当前版本包含入群验证和汇率/BIN 查询。
 
 ## 1. 运行条件
 
-Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并能连接 Telegram API。
+Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并能连接 Telegram API、`api.exchangerate.fun`（汇率）与 `cardbincheck.com`（BIN 查询）。查询在命令线程内同步执行（10 秒超时），上游不可用时提示用户稍后再试，不影响其他业务。
 
 | 环境变量 | 用途 / 默认值 |
 |---|---|
@@ -16,6 +16,7 @@ Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并
 | `VERIFY_SECONDS` | 验证有效期，30–300 秒，默认 240；超出范围自动收敛 |
 | `DELETE_AFTER_SECONDS` | 群内机器人消息自动清理，0–3600 秒，默认 30；0 为关闭 |
 | `DB_PATH` | SQLite 路径，默认 `bot.sqlite3`；systemd 覆盖为 `/var/lib/tgbot/bot.sqlite3` |
+| `BIN_API_KEY` | 可选，cardbincheck.com（IPNOVA）的 BIN 查询密钥；留空按上游免费 IP 限流访问，配置后按额度计费 |
 | `SSH_HOST` / `SSH_PORT` / `SSH_USER` / `SSH_PASSWORD` | 可选本地部署连接信息，机器人运行不使用；不要复制到服务器运行配置 |
 
 复制 `.env.example` 为 `.env` 并设置权限 `600`（服务专用用户读取时为 `640` 且属组为服务组）。环境变量优先于文件配置。不要在 Git、日志或文档中保存真实 token 与密码。
@@ -63,7 +64,7 @@ journalctl -u tgbot -n 50 --no-pager
 
 启动日志应包含 `Started @用户名 group=群ID`。功能验证建议用自己的测试账号申请入群，确认：私聊收到卡片、未关注时提示先关注、答对后自动批准、答错 3 次或超时被拒绝、验证卡片在结束后按 30 秒清理。
 
-菜单文案变化后运行 `python3 scripts/update_commands.py`（只更新已有菜单，不发送群消息），再用 Telegram 客户端确认命令菜单只剩 `/start`、`/help`。
+菜单文案变化后运行 `python3 scripts/update_commands.py`（只更新已有菜单，不发送群消息），再用 Telegram 客户端确认命令菜单为 `/start`、`/help`、`/rate`、`/bin`。
 
 ## 5. 从旧版本升级（破坏性，无迁移）
 
@@ -111,6 +112,9 @@ systemctl start tgbot
 | 日志出现 `Verification conclusion deferred` | 机器人缺少限制/邀请权限或 Telegram 暂时失败；记录保留并每 30 秒重试 |
 | 日志出现 `Restore permissions failed` | 恢复发言失败，后台每 30 秒重试，最多 5 次；随后写 `verification_restore_gaveup` 审计并停止，需在 Telegram 手动解除限制 |
 | 日志出现 `Polling conflict` | 有另一个进程用同一 token 在轮询（Telegram 返回 409）；停掉多余实例 |
+| `/bin` 提示上游限流 | cardbincheck.com 免费档按 IP 限流或额度用尽；结果已缓存 24 小时，等待后重试，不要提高请求频率 |
+| `/bin` 提示密钥无效 | `.env` 的 `BIN_API_KEY` 格式错误或已失效；核对后重启服务 |
+| `/rate` 或 `/bin` 提示暂时不可用 | 上游接口网络失败或返回异常；用 `curl` 直接访问 `api.exchangerate.fun/latest`、`cardbincheck.com/api/bin/424242` 核对 |
 | 启动报 `verification table has an incompatible schema` | 数据库仍是旧结构；按第 5 节删除验证相关表后重启，不做自动迁移 |
 
 日志只记录动作、标识和错误码，不记录 token、完整请求头或消息原文。

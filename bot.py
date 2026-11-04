@@ -13,7 +13,9 @@ import sqlite3
 import time
 
 from retention import NOTICE_SECONDS
+from binlookup import BinError, BinLookup
 from botapi import API, APIError
+from exchange import Exchange, RateError
 from verification import MAX_ATTEMPTS, Verification
 
 LOG = logging.getLogger('groupbot')
@@ -68,6 +70,8 @@ class Bot:
           attempts INTEGER DEFAULT 0,due INTEGER,PRIMARY KEY(chat,message_id));
         ''')
         self.verification = Verification(self)
+        self.exchange = Exchange(self.db)
+        self.bin_lookup = BinLookup(self.db, api_key=cfg.get('BIN_API_KEY', ''))
         self.username = ''
         self.bot_id = 0
 
@@ -274,6 +278,10 @@ class Bot:
             self.send(uid, self.start_text())
         elif name == '/help':
             self.send(uid, self.help_text())
+        elif name == '/rate':
+            self.rate_reply(message)
+        elif name == '/bin':
+            self.bin_reply(message)
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
@@ -301,6 +309,12 @@ class Bot:
         if self.verification.pending(sender['id']):
             # 未完成验证的成员在群内的消息不参与业务。
             return
+        if name == '/rate':
+            self.rate_reply(message)
+            return
+        if name == '/bin':
+            self.bin_reply(message)
+            return
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。',
                       _delete_after=self.notice_seconds())
@@ -322,6 +336,26 @@ class Bot:
             return ''
         return name[0].lower()
 
+    # --- 工具查询 ---------------------------------------------------------
+
+    def rate_reply(self, message):
+        chat = message['chat']['id']
+        try:
+            text = self.exchange.convert((message.get('text') or '').split()[1:])
+        except RateError as exc:
+            self.send(chat, str(exc), _delete_after=self.notice_seconds())
+            return
+        self.send(chat, text)
+
+    def bin_reply(self, message):
+        chat = message['chat']['id']
+        try:
+            text = self.bin_lookup.query((message.get('text') or '').split()[1:])
+        except BinError as exc:
+            self.send(chat, str(exc), _delete_after=self.notice_seconds())
+            return
+        self.send(chat, text)
+
     # --- 说明文案 ---------------------------------------------------------
 
     def help_text(self):
@@ -334,7 +368,9 @@ class Bot:
                 '管理员与群主直接放行。\n\n'
                 '<b>命令</b>\n'
                 '/start — 私聊开始使用\n'
-                '/help — 查看本说明')
+                '/help — 查看本说明\n'
+                '/rate — 汇率换算：/rate 100 USD CNY\n'
+                '/bin — 卡 BIN 查询：/bin 45717360')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'

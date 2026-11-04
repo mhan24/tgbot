@@ -8,7 +8,9 @@ import unittest
 from unittest.mock import patch
 
 from bot import Bot, DEFAULT_VERIFY_SECONDS, config
+from binlookup import BinError
 from botapi import API, APIError
+from exchange import RateError
 
 
 class FakeAPI:
@@ -76,11 +78,11 @@ class CoreTests(unittest.TestCase):
         self.bot.handle(self.message(1, '/help'))
         sent = [data for method, data in self.api.calls if method == 'sendMessage'][-1]
         self.assertEqual(sent['parse_mode'], 'HTML')
-        for token in ('入群验证', '关联频道', '/start', '/help'):
+        for token in ('入群验证', '关联频道', '/start', '/help', '/rate', '/bin'):
             self.assertIn(token, sent['text'])
         for gone in ('原石', '抽卡', '黑名单', '尚未'):
             self.assertNotIn(gone, sent['text'])
-        for gone in ('/checkin', '/points', '/rank', '/manage', '/report', '/appeal', '/bin', '/rate'):
+        for gone in ('/checkin', '/points', '/rank', '/manage', '/report', '/appeal'):
             self.assertNotIn(gone, sent['text'])
 
     def test_help_accepts_bot_suffix_and_ignores_other_bot_suffix(self):
@@ -110,6 +112,43 @@ class CoreTests(unittest.TestCase):
             self.bot.handle(self.message(1, '/checkin'))
         self.assertIn('/help', self.api.texts()[-1])
         self.assertEqual(self.queued()[self.api.sent], 1000 + 120)
+
+    def test_rate_and_bin_commands_are_dispatched_with_arguments(self):
+        with patch.object(self.bot.exchange, 'convert', return_value='RATE_TEXT') as convert, \
+                patch.object(self.bot.bin_lookup, 'query', return_value='BIN_TEXT') as query:
+            self.bot.handle(self.message(1, '/rate 100 USD CNY'))
+            # 指向其他机器人的命令静默忽略。
+            self.bot.handle(self.message(2, '/rate@otherbot 100 USD CNY'))
+            self.bot.handle(self.message(3, '/bin 45717360'))
+            self.assertEqual(convert.call_args_list[0][0][0], ['100', 'USD', 'CNY'])
+            self.assertEqual(convert.call_count, 1)
+            self.assertEqual(query.call_args_list[0][0][0], ['45717360'])
+            self.assertIn('RATE_TEXT', self.api.texts())
+            self.assertIn('BIN_TEXT', self.api.texts())
+            # 群内成功回复进入普通清理队列；私聊成功回复不排队。
+            self.assertTrue(self.queued())
+            before = len(self.queued())
+            self.bot.handle(self.message(4, '/rate USD CNY', chat=5, chat_type='private'))
+            self.assertEqual(len(self.queued()), before)
+
+    def test_rate_and_bin_failures_use_notice_lifetime_in_group(self):
+        with patch('bot.time.time', return_value=1000), \
+                patch.object(self.bot.exchange, 'convert',
+                             side_effect=RateError('汇率服务暂时不可用，请稍后重试。')), \
+                patch.object(self.bot.bin_lookup, 'query',
+                             side_effect=BinError('用法：/bin 45717360（6–8 位数字）。')):
+            self.bot.handle(self.message(1, '/rate USD CNY'))
+            self.bot.handle(self.message(2, '/bin x'))
+        self.assertEqual(self.queued()[self.api.sent - 1], 1120)
+        self.assertEqual(self.queued()[self.api.sent], 1120)
+
+    def test_rate_and_bin_still_require_pending_verification_in_group(self):
+        with patch.object(self.bot.exchange, 'convert', return_value='RATE_TEXT') as convert:
+            self.bot.verification.admit({'id': 7, 'first_name': 'P'}, 'member', self.bot.group)
+            self.api.calls.clear()
+            self.bot.handle(self.message(1, '/rate USD CNY', uid=7))
+        convert.assert_not_called()
+        self.assertEqual(self.api.calls, [])
 
     def test_group_default_retention_and_explicit_overrides(self):
         with patch('bot.time.time', return_value=100):
@@ -193,7 +232,8 @@ class CoreTests(unittest.TestCase):
         tables = {row[0] for row in self.bot.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(tables, {'meta', 'processed', 'audit', 'deletions',
-                                   'verification', 'verification_prompts'})
+                                   'verification', 'verification_prompts',
+                                   'rates', 'bin_cache'})
         self.assertFalse(tables & {'point_users', 'point_events', 'checkin_pity', 'checkin_draws',
                                    'mutes', 'upgrades', 'private_steps', 'known_bots',
                                    'user_activity'})

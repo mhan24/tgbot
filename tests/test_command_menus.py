@@ -42,7 +42,7 @@ class MenuTests(unittest.TestCase):
         self.assertEqual({data['chat_id'] for method, data in calls
                           if method == 'getChatAdministrators'}, {-1})
         commands = {item['command'] for menu in menus.values() for item in menu}
-        self.assertEqual(commands, {'start', 'help'})
+        self.assertEqual(commands, {'start', 'help', 'rate', 'bin'})
         self.assertFalse(commands & {'checkin', 'points', 'report', 'manage'})
         self.assertTrue(any(menu == [] for menu in menus.values()))
 

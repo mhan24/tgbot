@@ -1,6 +1,6 @@
 # Telegram 入群验证机器人
 
-从零重构的版本，使用 Python 3.9+ 标准库与 SQLite，只实现入群验证系统。
+从零重构的版本，使用 Python 3.9+ 标准库与 SQLite，实现入群验证和两个免费工具查询。
 
 ## 现有功能
 
@@ -10,6 +10,8 @@
 | 直接入群验证 | 被邀请直接进群的普通成员先被禁言，在群内完成同样的验证后恢复发言；超时或答错 3 次会被移出 |
 | 放行 | 群主和管理员直接放行；Bot 只接受管理员或群主邀请，其他 Bot 立即封禁 |
 | 提示 | `/help` 在群和私聊说明验证步骤与规则，`/start` 私聊说明入群流程 |
+| 汇率换算 | `/rate 100 USD CNY`，或 `/rate USD CNY`；exchangerate.fun 免钥接口，USD 基准缓存 1 小时，显示数据时间 |
+| 卡 BIN 查询 | `/bin 45717360`（6–8 位数字）；cardbincheck.com（IPNOVA）接口，密钥可选，成功结果缓存 24 小时，缺失字段显示未知 |
 
 验证规则：算术题为两位数加法四选一；有效期由 `VERIFY_SECONDS` 决定（默认 240 秒）；最多答错 3 次。未关注频道时点击答案只提示先关注，不消耗答错次数，也不会通过验证。验证卡片在验证期间保留，结束（通过、答错上限、超时）后按群自动清理时长删除。
 
@@ -46,9 +48,19 @@ python3 bot.py
 
 - [bot.py](bot.py)：配置、Telegram 调用、单群过滤、消息生命周期、更新分发与长轮询。
 - [verification.py](verification.py)：验证状态机（发题、判题、通过、超时/答错拒绝、投递与恢复重试）。
+- [exchange.py](exchange.py)、[binlookup.py](binlookup.py)：汇率换算与卡 BIN 查询，各自维护缓存表。
 - [botapi.py](botapi.py)：Bot API 传输层，区分可重试与永久失败。
 - [retention.py](retention.py)：失败与处罚通知的显式保留时长。
 - [scripts](scripts)：命令菜单说明维护；[tests](tests)：使用模拟 Telegram 与内存 SQLite 的回归测试。
+
+### 外部服务
+
+| 接口 | 用途 |
+|---|---|
+| `api.exchangerate.fun/latest` | 汇率数据，免费免钥，每小时更新 |
+| `cardbincheck.com/api/bin/{bin}` | BIN 数据（IPNOVA），`BIN_API_KEY` 可选：配置后按额度计费，未配置按 IP 限流；成功结果缓存 24 小时 |
+
+两个上游在命令处理线程内同步调用（10 秒超时）；失败有明确提示，不使用过期缓存伪造结果。参考过的 freebinchecker 公开 API 目前被 Cloudflare 人机验证拦截，服务端不可用，故未采用。
 
 ## 文档与维护
 
