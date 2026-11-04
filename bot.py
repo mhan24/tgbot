@@ -2,7 +2,7 @@
 """Telegram 群管机器人运行核心：单群过滤、入群验证、消息生命周期与长轮询。
 
 只依赖 Python 标准库。所有运行参数来自 `.env` / 环境变量，修改后需重启服务。
-原石与抽卡功能将作为独立模块接入本核心，业务规则不写在分发层。
+分发层只做路由，业务规则写在各功能模块里。
 """
 import html
 import logging
@@ -317,11 +317,10 @@ class Bot:
                 '<b>入群验证</b>\n新成员入群前需完成两步验证：' + channel + '\n'
                 f'验证限时 {self.verification.limit_text()}，最多答错 {MAX_ATTEMPTS} 次；'
                 '超时或连续答错会被拒绝或移出，可重新申请入群。\n'
-                '管理员与群主直接放行，黑名单成员拒绝入群。\n\n'
+                '管理员与群主直接放行。\n\n'
                 '<b>命令</b>\n'
                 '/start — 私聊开始使用\n'
-                '/help — 查看本说明\n\n'
-                '原石与抽卡功能尚未启用。')
+                '/help — 查看本说明')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'

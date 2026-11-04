@@ -76,8 +76,10 @@ class CoreTests(unittest.TestCase):
         self.bot.handle(self.message(1, '/help'))
         sent = [data for method, data in self.api.calls if method == 'sendMessage'][-1]
         self.assertEqual(sent['parse_mode'], 'HTML')
-        for token in ('入群验证', '关联频道', '/start', '/help', '黑名单'):
+        for token in ('入群验证', '关联频道', '/start', '/help'):
             self.assertIn(token, sent['text'])
+        for gone in ('原石', '抽卡', '黑名单', '尚未'):
+            self.assertNotIn(gone, sent['text'])
         for gone in ('/checkin', '/points', '/rank', '/manage', '/report', '/appeal', '/bin', '/rate'):
             self.assertNotIn(gone, sent['text'])
 
