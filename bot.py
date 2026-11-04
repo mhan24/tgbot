@@ -65,7 +65,6 @@ class Bot:
         CREATE TABLE IF NOT EXISTS processed(id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,
           target INTEGER,action TEXT,detail TEXT);
-        CREATE TABLE IF NOT EXISTS blacklist(uid INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,reason TEXT);
         CREATE TABLE IF NOT EXISTS deletions(chat INTEGER,message_id INTEGER,
           attempts INTEGER DEFAULT 0,due INTEGER,PRIMARY KEY(chat,message_id));
         ''')
@@ -189,9 +188,6 @@ class Bot:
         return self.call('getChatMember', chat_id=self.group,
                          user_id=uid)['status'] in ('creator', 'administrator')
 
-    def blacklisted(self, uid):
-        return bool(self.db.execute('SELECT 1 FROM blacklist WHERE uid=?', (uid,)).fetchone())
-
     def subscribed(self, uid):
         member = self.call('getChatMember', chat_id=self.channel, user_id=uid)
         return member['status'] in ('creator', 'administrator', 'member') or (
@@ -263,10 +259,6 @@ class Bot:
         if not uid:
             return
         if not self.active(old) and self.active(new):
-            if uid != self.bot_id and self.blacklisted(uid):
-                self.call('banChatMember', chat_id=self.group, user_id=uid)
-                self.audit(0, uid, 'blacklist_rejoin')
-                return
             self.verification.admit(user, 'member', self.group, event.get('from'))
         elif self.active(old) and not self.active(new):
             self.verification.forget(uid)

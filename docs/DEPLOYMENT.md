@@ -77,9 +77,17 @@ sqlite3 /var/lib/tgbot/bot.sqlite3 \
 systemctl start tgbot
 ```
 
-- 旧验证记录、进行中的验证和旧验证卡片记录会被清空；进行中的申请人需要重新申请。
-- 旧版积分、签到、举报等表不读取也不自动删除；要彻底重置需另行授权后手工 `DROP TABLE`。
-- 结构不匹配时服务会启动失败并报 `verification table has an incompatible schema`，按上面步骤重建表即可。
+- 更彻底的方式（本次重构采用）：停服后直接删除数据库文件，机器人启动时重建全部 6 张表：
+
+  ```sh
+  systemctl stop tgbot
+  rm -f /var/lib/tgbot/bot.sqlite3 /var/lib/tgbot/bot.sqlite3-wal /var/lib/tgbot/bot.sqlite3-shm
+  systemctl start tgbot
+  ```
+
+- 删除数据库即丢失全部验证记录、处理位置和审计记录；进行中的申请人需要重新申请，已通过验证的成员重新进群会再验证一次。
+- 本次重构按用户要求**没有保留旧库、旧表和备份**：服务器上旧版备份目录与旧代码一起删除，`.env` 未改动。
+- 结构不匹配时服务会启动失败并报 `verification table has an incompatible schema`，按上面步骤重建数据库即可。
 
 ## 6. 备份与恢复
 

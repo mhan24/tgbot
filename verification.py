@@ -78,9 +78,6 @@ class Verification:
         uid = int(user.get('id') or 0)
         if not uid or uid == self.bot.bot_id:
             return
-        if self.bot.blacklisted(uid):
-            self._reject(uid, kind, 'blacklist')
-            return
         if user.get('is_bot'):
             if inviter and not inviter.get('is_bot') and self._is_admin(int(inviter.get('id') or 0)):
                 self.bot.audit(int(inviter['id']), uid, 'allow_invited_bot')

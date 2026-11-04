@@ -40,12 +40,11 @@
 |---|---|
 | 群主、管理员 | 直接放行，不发题、不禁言 |
 | Bot | 只有群主或管理员邀请才放行；其他情况立即封禁 |
-| 黑名单成员 | 申请被拒绝；已进群则直接封禁 |
 | 机器人自己 | 忽略 |
 | 已验证成员 24 小时内重新入群 | 不再重复验证（保留通过状态一天） |
 | 成员离开群 | 取消未完成的验证；已通过的记录保留到过期 |
 
-黑名单只能由数据库维护人员写入，当前版本没有新增或解封入口。管理员仍可在 Telegram 里手动操作群成员。
+本版本没有黑名单、警告或禁言记录：管理员在 Telegram 里手动操作群成员即可。
 
 ## 3. 消息保留
 
@@ -73,7 +72,7 @@
 | 恢复发言权限失败 | 保留通过状态并每 30 秒重试，最多 5 次 |
 | 禁言失败（无法限制新成员） | 不发验证卡片，记录 `verification_restrict_failed` 审计 |
 
-Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`blacklist_reject`、`reject_bot`、`allow_invited_bot`、`verification_approve_failed` 等动作。
+Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`reject_bot`、`allow_invited_bot`、`verification_approve_failed` 等动作。
 
 ## 6. 限制
 

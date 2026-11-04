@@ -36,14 +36,13 @@ Telegram getUpdates
 | `meta` | 处理位置 `offset`、启动时间 |
 | `processed` | 已处理更新 ID，防止重复处理 |
 | `audit` | 操作与判决记录（谁对谁做了什么） |
-| `blacklist` | 历史黑名单，验证时只读；当前版本没有新增入口 |
 | `deletions` | 待删除群消息队列（重试次数、到期时间） |
 | `verification` | 每人一行验证状态：题型、题目、答案、随机串、有效期、答错次数、`state`、投递与恢复重试字段 |
 | `verification_prompts` | 群内验证卡片的消息 ID，与验证随机串绑定，结束后转入删除队列 |
 
-数据库采用 WAL。备份应使用 SQLite backup API 或停服后完整复制，避免只复制正在写入的主文件。
+数据库采用 WAL，表结构只由当前代码创建，共 6 张表。
 
-**不做迁移、不做兼容**：初始化只创建当前完整结构，代码里没有 `ALTER TABLE`、旧字段读取或数据搬迁分支。如果现有 `verification` 表结构与 `Verification.REQUIRED_COLUMNS` 不一致，构造 `Bot` 会直接抛 `RuntimeError` 并提示删除 `verification`、`verification_prompts` 后重启——不会静默改表，也不会尝试兼容旧行。旧版其他遗留表（积分、签到、举报等）不再创建、不再读取，也不由代码删除。
+**不做迁移、不做兼容、不保留旧数据**：初始化只创建当前完整结构，代码里没有 `ALTER TABLE`、旧字段读取或数据搬迁分支。如果现有 `verification` 表结构与 `Verification.REQUIRED_COLUMNS` 不一致，构造 `Bot` 会直接抛 `RuntimeError` 并提示删除 `verification`、`verification_prompts` 后重启——不会静默改表，也不会尝试兼容旧行。旧版本的积分、签到、举报、设置等表不在代码里：本次重构重建了数据库文件，旧表和数据都不再存在。
 
 ## 状态与重试
 

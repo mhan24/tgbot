@@ -248,21 +248,6 @@ class VerificationTests(unittest.TestCase):
         self.join(2)
         self.assertEqual(self.row()['state'], 'challenge')
 
-    # --- 黑名单 -----------------------------------------------------------
-
-    def test_blacklisted_applicants_are_declined_and_members_removed(self):
-        with self.bot.db:
-            self.bot.db.execute("INSERT INTO blacklist(uid,at,actor,reason) VALUES(2,0,0,'test')")
-        self.request(2)
-        self.assertEqual([data['user_id'] for method, data in self.api.calls
-                          if method == 'declineChatJoinRequest'], [2])
-        self.assertIsNone(self.row(2))
-        self.api.calls.clear()
-        self.join(2)
-        self.assertEqual([data['user_id'] for method, data in self.api.calls
-                          if method == 'banChatMember'], [2])
-        self.assertIsNone(self.row(2))
-
     # --- 投递与失败恢复 ---------------------------------------------------
 
     def test_transient_delivery_failure_is_retried(self):
