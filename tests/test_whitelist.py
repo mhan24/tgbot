@@ -20,9 +20,8 @@ class Tests(unittest.TestCase):
         return {'chat': {'id': self.group, 'type': 'supergroup'}, 'message_id': mid,
                 'from': {'id': uid, 'first_name': 'Vip'}, 'text': text, 'date': int(time.time())}
 
-    def white(self, uid=2, mid=1):
-        self.bot._moderation_action({'chat': {'id': self.group}, 'text': f'/white {uid} 测试',
-                          'from': {'id': 1}, 'message_id': mid}, mid)
+    def white(self, uid=2):
+        self.bot.moderate('white', uid, 1, note='测试')
 
     def test_whitelisted_member_cannot_be_submitted_to_jev(self):
         self.bot.cfg['JEV_API_KEY'] = 'test'
@@ -54,8 +53,7 @@ class Tests(unittest.TestCase):
 
     def test_remove_from_whitelist_restores_membership_rules(self):
         self.white()
-        self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/unwhite 2',
-                          'from': {'id': 1}, 'message_id': 2}, 2)
+        self.bot.moderate('unwhite', 2, 1)
         self.assertFalse(self.bot.whitelisted(2))
         self.assertFalse(self.bot.exempt(2))
 
@@ -63,7 +61,7 @@ class Tests(unittest.TestCase):
         self.white()
         self.api.calls.clear()
         self.bot.command({'chat': {'id': self.group}, 'text': '/manage',
-                          'from': {'id': 1}, 'message_id': 3}, 3)
+                          'from': {'id': 1}, 'message_id': 3})
         text = [d['text'] for method, d in self.api.calls if method == 'sendMessage'][-1]
         self.assertIn('白名单', text)
         self.assertIn('2', text)
@@ -73,8 +71,11 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.bot.whitelisted(1))
 
     def test_non_admin_cannot_manage_whitelist(self):
-        self.bot._moderation_action({'chat': {'id': self.group}, 'text': '/white 2',
-                          'from': {'id': 2}, 'message_id': 4}, 4)
+        self.bot.moderation.open(self.group, 1, 2)
+        row = self.bot.db.execute('SELECT * FROM moderation_panels').fetchone()
+        self.bot.moderation.callback({'id': 'q', 'from': {'id': 2},
+            'data': f'mod:{self.group}:{row["token"]}:white',
+            'message': {'chat': {'id': self.group}, 'message_id': row['message']}})
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM whitelist').fetchone()[0], 0)
 
     def test_whitelisted_join_is_approved_without_challenge(self):

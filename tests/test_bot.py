@@ -103,17 +103,21 @@ class Tests(unittest.TestCase):
         self.bot.warn(2, 'same', 'test')
         self.assertEqual(self.bot.db.execute('SELECT count FROM warnings').fetchone()[0], 1)
 
-    def test_non_admin_cannot_mute(self):
-        self.bot._moderation_action({'text': '/mute 3', 'from': {'id': 2}}, 10)
+    def test_moderate_refuses_protected_targets(self):
+        self.assertFalse(self.bot.moderate('mute', 0))
+        self.assertFalse(self.bot.moderate('mute', 1))
         self.assertFalse(any(m == 'restrictChatMember' for m, _ in self.api.calls))
 
-    def test_admin_can_mute_but_not_admin_target(self):
-        self.bot._moderation_action({'text': '/mute 2 60', 'from': {'id': 1}}, 10)
+    def test_moderate_mutes_member_for_requested_seconds(self):
+        self.assertTrue(self.bot.moderate('mute', 2, seconds=3600))
         restrict = [d for m, d in self.api.calls if m == 'restrictChatMember']
         self.assertEqual(len(restrict), 1)
         self.assertAlmostEqual(restrict[0]['until_date'], time.time() + 3600, delta=3)
-        self.bot._moderation_action({'text': '/mute 1', 'from': {'id': 1}}, 11)
-        self.assertEqual(sum(m == 'restrictChatMember' for m, _ in self.api.calls), 1)
+        self.assertEqual(self.db_mute_minutes(), 60)
+
+    def db_mute_minutes(self):
+        return int([d['text'] for m, d in self.api.calls if m == 'sendMessage'][-1]
+                   .split('时长 ')[1].split(' 分钟')[0])
 
     def test_direct_join_restricts_and_approval_not_challenged_twice(self):
         self.bot.joined({'id': 2})
@@ -148,18 +152,14 @@ class Tests(unittest.TestCase):
             self.bot.handle({'update_id': 30+i, 'message': {'chat': {'id': -1}, 'message_id': 30+i, 'from': {'id': 777000}, 'sender_chat': {'id': -55}, 'text': '日赚1000，私聊我'}})
         self.assertEqual(sum(m == 'banChatSenderChat' for m, _ in self.api.calls), 0)
 
-    def test_ban_command_removes_and_blacklists(self):
-        msg = {'chat': {'id': -1}, 'text': '/ban 广告', 'from': {'id': 1},
-               'reply_to_message': {'from': {'id': 2, 'is_bot': False}}}
-        self.bot._moderation_action(msg, 1)
+    def test_ban_removes_and_blacklists(self):
+        self.assertTrue(self.bot.moderate('ban', 2, 1, note='广告'))
         self.assertEqual(self.bot.db.execute('SELECT uid FROM blacklist').fetchone()[0], 2)
         self.assertEqual([d['user_id'] for m, d in self.api.calls if m == 'banChatMember'], [2])
 
     def test_ban_refuses_admin_and_self(self):
         for target in (self.bot.bot_id, 1):
-            msg = {'chat': {'id': -1}, 'text': '/ban', 'from': {'id': 1},
-                   'reply_to_message': {'from': {'id': target, 'is_bot': False}}}
-            self.bot._moderation_action(msg, 1)
+            self.assertFalse(self.bot.moderate('ban', target, 1))
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM blacklist').fetchone()[0], 0)
         self.assertFalse(any(m == 'banChatMember' for m, _ in self.api.calls))
 
@@ -180,9 +180,7 @@ class Tests(unittest.TestCase):
     def test_unban_allows_rejoin(self):
         with self.bot.db:
             self.bot.db.execute("INSERT INTO blacklist(uid,at,actor,reason) VALUES(2,0,0,'t')")
-        msg = {'chat': {'id': -1}, 'text': '/unban', 'from': {'id': 1},
-               'reply_to_message': {'from': {'id': 2, 'is_bot': False}}}
-        self.bot._moderation_action(msg, 1)
+        self.assertTrue(self.bot.moderate('unban', 2, 1))
         self.assertFalse(self.bot.blacklisted(2))
         self.assertEqual([d['user_id'] for m, d in self.api.calls if m == 'unbanChatMember'], [2])
 
@@ -305,7 +303,7 @@ class Tests(unittest.TestCase):
     def test_removed_admin_commands_are_not_registered(self):
         for command in ('/flagged', '/unflag 2'):
             with self.subTest(command=command):
-                self.assertFalse(self.bot.command({'text': command, 'from': {'id': 1}}, 1))
+                self.assertFalse(self.bot.command({'text': command, 'from': {'id': 1}}))
 
 if __name__ == '__main__':
     unittest.main()

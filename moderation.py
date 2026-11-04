@@ -34,12 +34,14 @@ class Moderation:
                 target = 0
             self.open(chat, user['id'], target)
         except ValueError as exc:
-            self.bot.send(chat, html.escape(str(exc)))
+            self.bot.send(chat, html.escape(str(exc)),
+                          _delete_after=self.bot.notice_seconds())
         return True
 
     def open(self, chat, actor, target=0):
         if target and (target <= 0 or target == self.bot.bot_id or self.bot.admin(target)):
-            self.bot.send(chat, '不能对管理员或本机器人执行管理操作。')
+            self.bot.send(chat, '不能对管理员或本机器人执行管理操作。',
+                          _delete_after=self.bot.notice_seconds())
             return
         token = secrets.token_hex(6)
         now = int(time.time())
@@ -183,9 +185,8 @@ class Moderation:
             if self.bot.blacklisted(target) and action != 'unban':
                 answer('该成员已拉黑，请刷新面板。'); return True
             # Stable token makes warning retries idempotent even after API failure or restart.
-            command = 'mute' if action == 'hour' else action
-            self.bot._moderation_action({'text': f'/{command} {target}' + (' 60' if action == 'hour' else ''),
-                                         'from': {'id': user['id']}, 'chat': {'id': row['chat']}}, f'panel:{token}')
+            self.bot.moderate('mute' if action == 'hour' else action, target, user['id'],
+                              f'panel:{token}', seconds=3600 if action == 'hour' else None)
         elif not (action.startswith('u') and action[1:].isdigit() and not row['target']):
             answer('无效操作。'); return True
         with self.db:

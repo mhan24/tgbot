@@ -23,7 +23,8 @@ class Invitations:
             return False
         chat, user = msg['chat'], msg.get('from', {})
         if chat.get('type') != 'private':
-            self.bot.send(chat['id'], '请私聊机器人发送 /invite，领取自己的专属邀请链接。')
+            self.bot.send(chat['id'], '请私聊机器人发送 /invite，领取自己的专属邀请链接。',
+                          _delete_after=self.bot.notice_seconds())
             return True
         uid = user.get('id')
         if not uid or user.get('is_bot'):

@@ -9,6 +9,8 @@ CST = timezone(timedelta(hours=8))
 INVITE_DAILY_LIMIT = 10
 CHECKIN_PULLS = 10
 CHECKIN_POINTS = {3: 0, 4: 1, 5: 5, 6: 10}
+# Both standard (5) and featured UP (6) five-stars are 出金 for the gold ranking.
+GOLD_RARITIES = (5, 6)
 FOUR_STAR_RATE = 0.051
 FIVE_STAR_RATE = 0.006
 FOUR_STAR_PITY = 10
@@ -189,9 +191,9 @@ class Points:
             return 0, 'limit', None, pity4, pity5, guaranteed
 
     def award(self, user, kind, event, timestamp=None):
-        if kind == 'checkin':
-            amount, status, _, _, _, _ = self.checkin(user, event, timestamp)
-            return amount, status
+        """Credit a non-checkin points event; check-ins go through checkin()."""
+        if kind != 'message':
+            raise ValueError(f'unsupported points event kind: {kind}')
         day = self.day(timestamp)
         name = ' '.join(str(user.get(k) or '') for k in ('first_name', 'last_name')).strip() or user.get('username') or str(user['id'])
         with self.db:
@@ -199,15 +201,12 @@ class Points:
             previous = self.db.execute('SELECT amount FROM point_events WHERE event=?', (event,)).fetchone()
             if previous:
                 return previous[0], 'replay'
-            if kind == 'message':
-                earned = self.db.execute('SELECT COALESCE(sum(amount),0) FROM point_events '
-                                         'WHERE uid=? AND day=? AND kind=?',
-                                         (user['id'], day, kind)).fetchone()[0]
-                if earned >= self.message_daily_limit:
-                    return 0, 'limit'
-                amount = min(self.message_points, self.message_daily_limit - earned)
-            else:
-                raise ValueError(f'unsupported points event kind: {kind}')
+            earned = self.db.execute('SELECT COALESCE(sum(amount),0) FROM point_events '
+                                     'WHERE uid=? AND day=? AND kind=?',
+                                     (user['id'], day, kind)).fetchone()[0]
+            if earned >= self.message_daily_limit:
+                return 0, 'limit'
+            amount = min(self.message_points, self.message_daily_limit - earned)
             self.db.execute('INSERT INTO point_events VALUES(?,?,?,?,?)', (event,user['id'],day,kind,amount))
             self.db.execute('UPDATE point_users SET total=total+? WHERE uid=?', (amount,user['id']))
             return amount, 'added'
@@ -270,3 +269,50 @@ class Points:
                                    'FROM point_users WHERE total>0 ORDER BY total DESC,uid ASC LIMIT ? OFFSET ?',
                                    (size, page * size)).fetchall()
         return rows, total, page, pages
+
+    def gold_entries(self):
+        """Members who pulled a five-star, ordered by their first such draw.
+
+        Both standard (5) and featured UP (6) five-stars count as 出金. The list is
+        rebuilt from saved ten-pull results, so no separate ranking table or
+        migration is needed and every stored draw is included.
+        """
+        entries, order = {}, []
+        for row in self.db.execute('SELECT uid,results,at FROM checkin_draws ORDER BY at ASC, rowid ASC'):
+            try:
+                results = json.loads(row['results'])
+            except (TypeError, ValueError):
+                continue
+            golds = sum(1 for rarity in results if rarity in GOLD_RARITIES)
+            if not golds:
+                continue
+            uid = row['uid']
+            if uid not in entries:
+                first_at = int(row['at'] or 0)
+                entries[uid] = {'uid': uid, 'first_at': first_at,
+                                'first_day': datetime.fromtimestamp(first_at, CST).date().isoformat(),
+                                'golds': 0}
+                order.append(uid)
+            entries[uid]['golds'] += golds
+        names = {row['uid']: row['name'] for row in self.db.execute('SELECT uid,name FROM point_users')}
+        ranked = []
+        for position, uid in enumerate(order, 1):
+            entry = entries[uid]
+            entry['ordinal'] = position
+            entry['name'] = names.get(uid) or str(uid)
+            ranked.append(entry)
+        return ranked
+
+    def gold_leaderboard(self, page=0, size=50):
+        rows = self.gold_entries()
+        total = len(rows)
+        pages = max(1, (total + size - 1) // size)
+        page = min(max(0, page), pages - 1)
+        return rows[page * size:(page + 1) * size], total, page, pages
+
+    def gold_entry(self, uid):
+        """Ranking position of one member, or None when they never pulled 出金."""
+        for entry in self.gold_entries():
+            if entry['uid'] == uid:
+                return entry
+        return None

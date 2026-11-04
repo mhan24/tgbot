@@ -93,14 +93,11 @@ class Appeals:
         data=q.get('data','').split(':')
         if not data or data[0]!='appeal':return False
         def answer(t):self.bot.call('answerCallbackQuery',callback_query_id=q['id'],text=t,show_alert=True)
-        if len(data)==4:
-            if not data[2].lstrip('-').isdigit() or int(data[2])!=self.bot.group or not data[3].isdigit():
-                answer('该申请属于其他群，请在对应群组的管理上下文中处理。');return True
-            aid=int(data[3])
-        elif len(data)==3 and data[2].isdigit():
-            aid=int(data[2])
-        else:
+        if len(data)!=4:
             answer('无效申请。');return True
+        if not data[2].lstrip('-').isdigit() or int(data[2])!=self.bot.group or not data[3].isdigit():
+            answer('该申请属于其他群，请在对应群组的管理上下文中处理。');return True
+        aid=int(data[3])
         if data[1] not in ('approve','reject'):
             answer('无效申请。');return True
         if q['from']['id']!=self.owner():

@@ -18,7 +18,7 @@ import urllib.request
 
 from binlookup import BinLookup, LookupError, format_result
 from points import Points, INVITE_DAILY_LIMIT, format_checkin
-from retention import notice_delay
+from retention import NOTICE_SECONDS
 from attention import Attention
 from members import Members
 from jev_ads import JevAds
@@ -122,11 +122,12 @@ class Bot:
             'MUTE_SECONDS': self.mute_seconds,
             'VERIFY_SECONDS': self.verify_seconds,
             'DELETE_AFTER_SECONDS': self.delete_after,
-            'JEV_ENABLED': str(cfg.get('JEV_ENABLED', '1')).lower() in ('1', 'true', 'yes', 'on'),
+            # Only the canonical 1/0 and on/off tokens are accepted from now on.
+            'JEV_ENABLED': str(cfg.get('JEV_ENABLED', '1')).strip().lower() in ('1', 'on'),
             'UPGRADE_POINTS': self.upgrade_points,
             'UPGRADE_TAG': self.upgrade_tag,
         }
-        self.setting_defaults = {key: self.parse_group_setting(key, value)
+        self.setting_defaults = {key: self.parse_group_setting(key, '1' if value is True else '0' if value is False else value)
                                  for key, value in self.setting_defaults.items()}
         self.setting_values = dict(self.setting_defaults)
         self.setting_overrides = set()
@@ -159,14 +160,7 @@ class Bot:
             row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
             if row:
                 setattr(self, attribute, int(row[0]) if attribute == 'channel' else row[0])
-        for setting in self.db.execute('SELECT key,value FROM group_settings').fetchall():
-            if setting['key'] not in self.GROUP_SETTING_SPECS:
-                continue
-            try:
-                self.setting_values[setting['key']] = self.parse_group_setting(setting['key'], setting['value'])
-                self.setting_overrides.add(setting['key'])
-            except ValueError:
-                LOG.warning('Ignoring invalid stored group setting key=%s group=%s', setting['key'], self.group)
+        self._load_group_settings()
         self._apply_group_settings()
         self.bin_lookup = BinLookup(self.db)
         self.exchange = Exchange(self.db)
@@ -181,6 +175,27 @@ class Bot:
         self.username = ''
         self.bot_id = 0
 
+    def _load_group_settings(self):
+        """Load only current settings; obsolete or malformed rows are deleted on startup.
+
+        The current schema is authoritative: settings left behind by removed features
+        and values that no longer parse are dropped instead of being carried forward.
+        """
+        stale = []
+        for setting in self.db.execute('SELECT key,value FROM group_settings').fetchall():
+            try:
+                value = self.parse_group_setting(setting['key'], setting['value'])
+            except (KeyError, ValueError):
+                stale.append(setting['key'])
+                continue
+            self.setting_values[setting['key']] = value
+            self.setting_overrides.add(setting['key'])
+        if stale:
+            with self.db:
+                self.db.executemany('DELETE FROM group_settings WHERE key=?', ((key,) for key in stale))
+            LOG.warning('Removed obsolete group settings group=%s keys=%s',
+                        self.group, ','.join(sorted(stale)))
+
     @classmethod
     def parse_group_setting(cls, key, value):
         spec = cls.GROUP_SETTING_SPECS[key]
@@ -193,8 +208,7 @@ class Bot:
                 raise ValueError(f'{key} 范围为 {spec["min"]}–{spec["max"]}。')
             return number
         if spec['type'] == 'bool':
-            values = {'1': True, 'true': True, 'yes': True, 'on': True, '开启': True,
-                      '0': False, 'false': False, 'no': False, 'off': False, '关闭': False}
+            values = {'1': True, 'on': True, '0': False, 'off': False}
             if raw.lower() not in values:
                 raise ValueError(f'{key} 请输入 on/off 或 1/0。')
             return values[raw.lower()]
@@ -355,10 +369,11 @@ class Bot:
                                 (row['chat'], row['message_id']))
 
     def send(self, chat, text, keep=False, **kwargs):
-        # Retain failures long enough to read; active cards and explicit overrides take precedence.
-        if chat == self.group and not keep and '_delete_after' not in kwargs:
-            kwargs['_delete_after'] = notice_delay(text, self.delete_after)
         return self.call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', _keep=keep, **kwargs)
+
+    def notice_seconds(self):
+        """Explicit retention for failure and punishment notices; 0 follows the group setting."""
+        return NOTICE_SECONDS if self.delete_after > 0 else 0
 
     def audit(self, actor, target, action, detail=''):
         with self.db:
@@ -618,7 +633,8 @@ class Bot:
                 self.db.execute('UPDATE violations SET punished=1 WHERE event=?', (event,))
         label = f'<a href="tg://user?id={uid}">该成员</a>' if uid > 0 else f'频道 {uid}'
         if not silent:
-            self.send(self.group, f'⚠️ {label} 警告 {count}/3：{html.escape(reason)}{suffix}', _delete_after=120 if self.delete_after > 0 else 0)
+            self.send(self.group, f'⚠️ {label} 警告 {count}/3：{html.escape(reason)}{suffix}',
+                      _delete_after=self.notice_seconds())
         with self.db:
             self.db.execute('UPDATE violations SET done=1 WHERE event=?', (event,))
         self.audit(actor, uid, 'warn', reason)
@@ -689,7 +705,8 @@ class Bot:
             return True
         pending = self.db.execute("SELECT 1 FROM verification WHERE uid=? AND kind!='approved'", (user['id'],)).fetchone()
         if pending and not self.whitelisted(user['id']):
-            self.send(self.group,'请先完成入群验证，再使用积分功能。')
+            self.send(self.group,'请先完成入群验证，再使用积分功能。',
+                      _delete_after=self.notice_seconds())
             return True
         if cmd == '/checkin':
             visible = self.avatar_visible(user['id'], message_id=msg.get('message_id'), purpose='checkin')
@@ -699,7 +716,7 @@ class Bot:
                               '头像不可见时发起签到，本次不加分。请设置头像并允许所有人查看后重试。')
                 else:
                     self.send(self.group, '暂时无法核实头像，本次未加分、未计警告。请稍后重新发送 /checkin。',
-                              _delete_after=120 if self.delete_after > 0 else 0,
+                              _delete_after=self.notice_seconds(),
                               reply_parameters={'message_id': msg['message_id'], 'allow_sending_without_reply': True})
                 return True
             event = f'checkin:{self.group}:{msg["message_id"]}'
@@ -709,7 +726,7 @@ class Bot:
                 self.upgrade_member(user['id'])
             if status == 'limit':
                 text = '今天已经签到过了。北京时间零点后可再次签到。'
-                self.send(self.group, text, reply_parameters={
+                self.send(self.group, text, _delete_after=self.notice_seconds(), reply_parameters={
                     'message_id': msg['message_id'], 'allow_sending_without_reply': True})
                 return True
             if not self.points.checkin_notified(event, 'result'):
@@ -718,12 +735,13 @@ class Bot:
                                             'allow_sending_without_reply': True})
                 self.points.mark_checkin_notified(event, 'result')
             if any(rarity in (5, 6) for rarity in results or []) and not self.points.checkin_notified(event, 'broadcast'):
-                self.send(self.group, self._checkin_broadcast(user, amount, results))
+                entry = self.points.gold_entry(user['id'])
+                self.send(self.group, self._checkin_broadcast(user, amount, results, entry))
                 self.points.mark_checkin_notified(event, 'broadcast')
             return True
         return True
 
-    def _checkin_broadcast(self, user, amount, results):
+    def _checkin_broadcast(self, user, amount, results, entry=None):
         standard, up = results.count(5), results.count(6)
         total = standard + up
         name = ' '.join(str(user.get(k) or '') for k in ('first_name', 'last_name')).strip()
@@ -731,20 +749,27 @@ class Bot:
         mention = f'<a href="tg://user?id={user["id"]}">{html.escape(name)}</a>'
         if total == 1:
             tier = '五星 UP' if up else '五星常驻'
-            return f'🎉 {mention} 十连签到出现{tier}，获得 {amount} 积分！'
-        tier = '三黄' if total >= 3 else '双黄'
-        parts = []
-        if up:
-            parts.append(f'五星 UP ×{up}')
-        if standard:
-            parts.append(f'五星常驻 ×{standard}')
-        return f'🎉 {mention} 十连签到出现{tier}（{"、".join(parts)}），获得 {amount} 积分！'
+            text = f'🎉 {mention} 十连签到出现{tier}，获得 {amount} 积分！'
+        else:
+            tier = '三黄' if total >= 3 else '双黄'
+            parts = []
+            if up:
+                parts.append(f'五星 UP ×{up}')
+            if standard:
+                parts.append(f'五星常驻 ×{standard}')
+            text = f'🎉 {mention} 十连签到出现{tier}（{"、".join(parts)}），获得 {amount} 积分！'
+        if entry:
+            if entry['golds'] == total:
+                text += f'\n🌟 第 {entry["ordinal"]} 位出金，已进入出金榜。'
+            else:
+                text += f'\n🌟 出金榜第 {entry["ordinal"]} 位，累计出金 {entry["golds"]} 次。'
+        return text
 
     def private_ranking(self, msg, cmd):
         """Points details and full rankings are private-chat only."""
         chat = msg['chat']['id']
         if cmd not in ('/checkin','/rank','/points','/milestones'):
-            self.send(chat, '私聊支持积分、排行榜和达标榜：/points、/rank、/milestones。签到请在群内进行。')
+            self.send(chat, '私聊支持积分、排行榜和出金榜：/points、/rank、/milestones。签到请在群内进行。')
             return True
         uid = msg['from']['id']
         group_title = self.group_title
@@ -767,23 +792,32 @@ class Bot:
             self.send(chat,f'📍 群组：{safe_group_title}\n⭐ 我的积分：{total}\n今日签到：{str(checkin)+" 分" if checkin else "未签到"}\n今日发言积分：{messages}/{self.message_daily_limit}\n今日邀请积分：{self.points.invite_daily(uid)}/{INVITE_DAILY_LIMIT}\n总榜排名：{rank or "暂无"}')
             return True
         if cmd == '/milestones':
-            self.send(chat, f'📍 群组：{safe_group_title}\n{self.milestones_ranking()}')
+            text, markup = self.gold_ranking(uid, 0)
+            self.send(chat, f'📍 群组：{safe_group_title}\n{text}', reply_markup=markup)
         else:
             text, markup = self.ranking_page(uid, 0)
             self.send(chat, text, reply_markup=markup)
         return True
 
-    def milestones_ranking(self):
-        rows = self.db.execute('''SELECT p.name,m.ordinal FROM point_milestones m
-            JOIN point_users p ON p.uid=m.uid WHERE m.threshold=?
-            ORDER BY m.ordinal ASC LIMIT 50''',(self.upgrade_points,)).fetchall()
-        lines = [f'🏆 达标榜 · 前 50 名（{len(rows)} 人）']
+    def gold_ranking(self, uid, page):
+        """金榜：任何五星都上榜，按首次出金时间排序，不设门槛和人数上限。"""
+        rows, total, page, pages = self.points.gold_leaderboard(page)
+        lines = [f'🏆 {html.escape(self.group_title)} · 出金榜（共 {total} 人）',
+                 f'第 {page + 1}/{pages} 页 · 每页 50 人']
         if not rows:
-            lines.append('榜单暂时为空。')
+            lines.append('还没有成员出金。群内发送 /checkin，抽出五星即可上榜。')
         for row in rows:
-            name = html.escape(' '.join((row['name'] or '').split()).replace('@','＠'))
-            lines.append(f'{row["ordinal"]}. {name}')
-        return '\n'.join(lines)
+            name = ' '.join((row['name'] or '').split()).replace('@', '＠')
+            if len(name) > 20:
+                name = name[:19] + '…'
+            day = row['first_day']
+            lines.append(f'{row["ordinal"]}. {html.escape(name)} — 首次出金 {day} · 累计 {row["golds"]} 次')
+        buttons = []
+        if page > 0:
+            buttons.append({'text': '⬅️ 上一页', 'callback_data': f'gold:{self.group}:{uid}:{page - 1}'})
+        if page + 1 < pages:
+            buttons.append({'text': '下一页 ➡️', 'callback_data': f'gold:{self.group}:{uid}:{page + 1}'})
+        return '\n'.join(lines), {'inline_keyboard': [buttons] if buttons else []}
 
     def ranking_page(self, uid, page):
         rows, total, page, pages = self.points.leaderboard_page(page)
@@ -805,39 +839,38 @@ class Bot:
 
     def ranking_callback(self, query):
         data = query.get('data', '')
-        if not data.startswith('rank:'):
+        kind = data.split(':', 1)[0]
+        if kind not in ('rank', 'gold'):
             return False
+        page_command = '/rank' if kind == 'rank' else '/milestones'
         def answer(text=''):
             self.call('answerCallbackQuery', callback_query_id=query['id'], text=text)
         try:
-            fields=data.split(':')
-            if len(fields)==4:
-                _, group_id, owner, page = fields
-                if int(group_id)!=self.group: raise ValueError()
-            else:
-                _, owner, page = fields
+            _, group_id, owner, page = data.split(':')
+            if int(group_id) != self.group:
+                raise ValueError()
             owner, page = int(owner), int(page)
-        except ValueError:
-            answer('无效的页码，请重新发送 /rank。')
+        except (TypeError, ValueError):
+            answer(f'无效的页码，请重新发送 {page_command}。')
             return True
         msg = query.get('message', {})
         chat = msg.get('chat', {})
         if chat.get('type') != 'private' or chat.get('id') != owner or query['from']['id'] != owner:
-            answer('请在自己的私聊中查询排行榜。')
+            answer('请在自己的私聊中查询榜单。')
             return True
         try:
             member = self.call('getChatMember', chat_id=self.group, user_id=owner)
             active = member.get('status') in ('member', 'administrator', 'creator') or (
                 member.get('status') == 'restricted' and member.get('is_member'))
             if not active:
-                answer('请先加入管理群后再查询排行榜。')
+                answer('请先加入群组后再查询榜单。')
                 return True
-            text, markup = self.ranking_page(owner, page)
+            text, markup = (self.ranking_page if kind == 'rank' else self.gold_ranking)(owner, page)
             self.call('editMessageText', chat_id=owner, message_id=msg['message_id'],
                       text=text, parse_mode='HTML', reply_markup=markup)
         except APIError as exc:
             if 'message is not modified' not in str(exc).lower():
-                answer('暂时无法刷新排行榜，请稍后重试。')
+                answer('暂时无法刷新榜单，请稍后重试。')
                 return True
         answer()
         return True
@@ -850,11 +883,13 @@ class Bot:
         cmd = parts[0].split('@', 1)
         if cmd[0].lower() != '/rate' or (len(cmd) > 1 and cmd[1].lower() != self.username.lower()):
             return False
+        delay = None
         try:
             text = self.exchange.convert(parts[1:])
         except RateError as exc:
             text = str(exc)
-        self.send(msg['chat']['id'], text, reply_parameters={
+            delay = self.notice_seconds()
+        self.send(msg['chat']['id'], text, _delete_after=delay, reply_parameters={
             'message_id': msg['message_id'], 'allow_sending_without_reply': True})
         return True
 
@@ -866,14 +901,18 @@ class Bot:
         if cmd[0].lower() != '/bin' or (len(cmd)>1 and cmd[1].lower()!=self.username.lower()):
             return False
         chat = msg['chat']['id']
+        delay = None
         if len(parts) != 2:
             result = '用法：/bin 45717360（输入 6–8 位 BIN）'
+            delay = self.notice_seconds()
         else:
             try:
                 result = format_result(parts[1], self.bin_lookup.lookup(parts[1]))
             except LookupError as exc:
                 result = str(exc)
-        self.send(chat, result, reply_parameters={'message_id':msg['message_id'], 'allow_sending_without_reply':True},
+                delay = self.notice_seconds()
+        self.send(chat, result, _delete_after=delay,
+                  reply_parameters={'message_id':msg['message_id'], 'allow_sending_without_reply':True},
                   link_preview_options={'is_disabled':True})
         return True
 
@@ -897,7 +936,7 @@ class Bot:
                     '• /points — 私聊查看余额、今日积分与排名\n'
                     '• /report — 回复本群消息，提交 Jev 广告判断；1 名管理员或 5 名群员同意后警告一次\n'
                     '• /rank — 私聊查看排行榜，每页 50 人，按钮翻页，不艾特榜单成员\n'
-                    f'• 达标榜：/milestones — 首次达到 {self.upgrade_points} 分的前 50 位，不要求特定标签\n'
+                    '• 出金榜：/milestones — 出过五星（常驻或 UP）即上榜，按首次出金排序，不限人数，每页 50 人\n'
                     '• 汇率换算：/rate 100 USD CNY（或 /rate USD CNY）\n'
                     '• BIN 查询：/bin 45717360 — 输入 6–8 位 BIN\n'
                     f'• 入群验证：先关注关联频道，再完成算术题，{verify_time} 内最多答错 3 次\n'
@@ -911,6 +950,7 @@ class Bot:
                  '• /appeals — 查看含昵称提及、用户名和 ID 的待审申请，点击批准或拒绝；请先私聊 /start 以接收申请通知\n'
                  '• 批准后解除黑名单并清零警告，用户需重新申请入群；处理结果私聊通知申请人')
         automatic = (f'<b>自动规则</b>\n'
+                     '• 签到出五星（常驻或 UP）时群内播报并进入出金榜，双黄/三黄合并播报\n'
                      f'• 达到 {self.upgrade_points} 分发送「第 N 位达标」恭喜消息，30 秒后自动删除；已有自定义标签也会通知\n'
                      f'• 符合条件时升级为「{html.escape(self.upgrade_tag)}」，不覆盖已有标签\n'
                      '• 连续 3 个完整自然日每天签到、没有正常发言：按本群默认禁言时长禁言，积分不清零\n'
@@ -924,166 +964,164 @@ class Bot:
                   )
         return True
 
-    def command(self, msg, update_id):
-        """Public moderation entry; retired commands are deliberately not aliases."""
+    def command(self, msg):
+        """Public moderation entry: /manage, /audit and /status are the only commands."""
         words = msg.get('text', '').split()
         if not words:
             return False
         command = words[0].split('@', 1)
         if len(command) > 1 and command[1].lower() != self.username.lower():
             return False
-        if command[0].lower() == '/manage':
+        name = command[0].lower()
+        if name == '/manage':
             return self.moderation.command(msg)
-        if command[0].lower() in ('/audit', '/status'):
-            return self._moderation_action(msg, update_id)
+        if name == '/audit':
+            return self.audit_command(msg)
+        if name == '/status':
+            return self.status_command(msg)
         return False
 
-    def _moderation_action(self, msg, update_id):
-        """内部管理服务：面板调用统一动作服务；不向用户注册独立管理命令。
-
-        每次仍重新核验管理员和目标身份。公开入口只允许 /manage、/audit、/status。
-        """
-        text = msg.get('text', '')
-        parts = text.split()
-        if not parts:
-            return False
-        first = parts[0].split('@', 1)
-        if len(first) > 1 and first[1].lower() != self.username.lower():
-            return False
-        cmd = first[0].lower()
-        if cmd not in ('/warn', '/mute', '/unmute', '/resetwarn', '/ban', '/unban',
-                       '/white', '/unwhite', '/status',
-                       '/audit'):
-            return False
+    def admin_command(self, msg):
+        """Anonymous senders and members without administrator rights get no action."""
         uid = msg.get('from', {}).get('id')
-        # Anonymous/sender-chat commands cannot be attributed and are refused.
-        if msg.get('sender_chat') or not uid or not self.admin(uid):
+        if msg.get('sender_chat') or not uid:
+            return False
+        return self.admin(uid)
+
+    def audit_command(self, msg):
+        if not self.admin_command(msg):
             return True
-        if cmd == '/audit':
-            args = parts[1:]
-            target_filter = None
-            if args:
-                if len(args) != 1:
-                    self.send(self.group, '用法：/audit 查看最近 100 条全部日志；/audit 用户ID或@用户名 查看该用户日志。')
-                    return True
-                try:
-                    if args[0].isdigit():
-                        target_filter = int(args[0])
-                        if target_filter <= 0: raise ValueError()
-                    elif args[0].startswith('@'):
-                        target_filter = self.members.resolve(args[0])
-                        if not target_filter: raise ValueError()
-                    else: raise ValueError()
-                except Exception:
-                    self.send(self.group, '无法确定目标用户，请填写有效数字 ID 或已知 @用户名。')
-                    return True
-            limit = 20 if target_filter is not None else 100
-            if target_filter is not None:
-                rows = self.db.execute('SELECT * FROM audit WHERE target=? OR actor=? ORDER BY at DESC,id DESC LIMIT ?', (target_filter, target_filter, limit)).fetchall()
-            else:
-                rows = self.db.execute('SELECT * FROM audit ORDER BY at DESC,id DESC LIMIT ?', (limit,)).fetchall()
-            if not rows:
-                self.send(self.group, '暂无操作日志。' if target_filter is None else f'暂无涉及用户 {target_filter} 的操作日志。')
-                return True
-            heading = f'📜 最近 {limit} 条操作日志（实际 {len(rows)} 条）' + (f' · 用户 {target_filter}' if target_filter is not None else ' · 全部')
-            chunks = []; lines = []; size = 0
-            for row in rows:
-                at = time.strftime('%m-%d %H:%M:%S', time.localtime(row['at']))
-                actor = f'ID:{row["actor"]}' if row['actor'] else '系统'
-                target = f'ID:{row["target"]}' if row['target'] else '系统/群组'
-                line = f'• [{at}] {actor} 对 {target} 执行了 {html.escape(row["action"][:100])}' + (f' ({html.escape(row["detail"][:100])})' if row['detail'] else '')
-                units = len(line.encode('utf-16-le')) // 2 + 1
-                if lines and size + units > 3300:
-                    chunks.append('\n'.join(lines)); lines = []; size = 0
-                lines.append(line); size += units
-            if lines: chunks.append('\n'.join(lines))
-            for page, chunk in enumerate(chunks, 1):
-                self.send(self.group, f'{heading} · {page}/{len(chunks)}\n{chunk}')
+        args = msg.get('text', '').split()[1:]
+        if len(args) > 1:
+            self.send(self.group, '用法：/audit 查看最近 100 条全部日志；/audit 用户ID或@用户名 查看该用户日志。',
+                      _delete_after=self.notice_seconds())
             return True
-        if cmd == '/status':
-            pending = self.db.execute("SELECT count(*) FROM verification WHERE kind!='approved'").fetchone()[0]
-            banned = self.db.execute('SELECT count(*) FROM blacklist').fetchone()[0]
-            family = self.db.execute("SELECT count(*) FROM upgrades WHERE tag=?", (self.upgrade_tag,)).fetchone()[0]
-            tags = '正常' if self.can_manage_tags else '缺少 can_manage_tags 权限，已停用'
-            white = self.db.execute('SELECT count(*) FROM whitelist').fetchone()[0]
-            self.send(self.group, f'✅ 群管运行中\n待验证：{pending}\n黑名单：{banned}\n白名单：{white} 人\n标签升级：累计 {self.upgrade_points} 分改为「{self.upgrade_tag}」，已升级 {family} 人（{tags}）\n警告累计 3 次拉黑并删除消息。')
-            return True
-        args = parts[1:]
-        replied = msg.get('reply_to_message', {})
-        if args and args[0].startswith('@'):
+        target_filter = None
+        if args:
             try:
-                target = self.members.resolve(args.pop(0))
-            except (ValueError, APIError) as exc:
-                self.send(self.group, html.escape(str(exc)) if isinstance(exc, ValueError) else '暂时无法核实目标用户，未执行操作。')
+                if args[0].isdigit():
+                    target_filter = int(args[0])
+                    if target_filter <= 0:
+                        raise ValueError()
+                elif args[0].startswith('@'):
+                    target_filter = self.members.resolve(args[0])
+                    if not target_filter:
+                        raise ValueError()
+                else:
+                    raise ValueError()
+            except Exception:
+                self.send(self.group, '无法确定目标用户，请填写有效数字 ID 或已知 @用户名。',
+                          _delete_after=self.notice_seconds())
                 return True
-        elif replied:
-            if replied.get('sender_chat') or not replied.get('from'):
-                self.send(self.group, '请回复以个人身份发送的成员消息。')
-                return True
-            target = replied['from']['id']
-        elif args:
-            try:
-                target = self.members.resolve(args.pop(0))
-            except (ValueError, APIError) as exc:
-                self.send(self.group, html.escape(str(exc)) if isinstance(exc, ValueError) else '暂时无法核实目标用户，未执行操作。')
-                return True
+        limit = 20 if target_filter is not None else 100
+        if target_filter is not None:
+            rows = self.db.execute('SELECT * FROM audit WHERE target=? OR actor=? ORDER BY at DESC,id DESC LIMIT ?', (target_filter, target_filter, limit)).fetchall()
         else:
-            self.send(self.group, '请回复成员消息执行，或提供数字用户 ID / @用户名。')
+            rows = self.db.execute('SELECT * FROM audit ORDER BY at DESC,id DESC LIMIT ?', (limit,)).fetchall()
+        if not rows:
+            self.send(self.group, '暂无操作日志。' if target_filter is None else f'暂无涉及用户 {target_filter} 的操作日志。')
             return True
-        if target == self.bot_id or self.admin(target):
-            self.send(self.group, '不能对管理员或本机器人执行此操作。')
+        heading = f'📜 最近 {limit} 条操作日志（实际 {len(rows)} 条）' + (f' · 用户 {target_filter}' if target_filter is not None else ' · 全部')
+        chunks = []; lines = []; size = 0
+        for row in rows:
+            at = time.strftime('%m-%d %H:%M:%S', time.localtime(row['at']))
+            actor = f'ID:{row["actor"]}' if row['actor'] else '系统'
+            target = f'ID:{row["target"]}' if row['target'] else '系统/群组'
+            line = f'• [{at}] {actor} 对 {target} 执行了 {html.escape(row["action"][:100])}' + (f' ({html.escape(row["detail"][:100])})' if row['detail'] else '')
+            units = len(line.encode('utf-16-le')) // 2 + 1
+            if lines and size + units > 3300:
+                chunks.append('\n'.join(lines)); lines = []; size = 0
+            lines.append(line); size += units
+        if lines:
+            chunks.append('\n'.join(lines))
+        for page, chunk in enumerate(chunks, 1):
+            self.send(self.group, f'{heading} · {page}/{len(chunks)}\n{chunk}')
+        return True
+
+    def status_command(self, msg):
+        if not self.admin_command(msg):
             return True
-        if cmd == '/warn':
-            self.warn(target, f'command:{update_id}', ' '.join(args) or '管理员手动警告', uid)
-        elif cmd == '/mute':
-            if args and (not args[0].isdigit() or not 1 <= int(args[0]) <= 525600):
-                self.send(self.group, '禁言时长请输入 1–525600 分钟。')
-                return True
-            seconds = int(args[0]) * 60 if args else self.mute_seconds
-            until = int(time.time()) + seconds
+        pending = self.db.execute("SELECT count(*) FROM verification WHERE kind!='approved'").fetchone()[0]
+        banned = self.db.execute('SELECT count(*) FROM blacklist').fetchone()[0]
+        family = self.db.execute("SELECT count(*) FROM upgrades WHERE tag=?", (self.upgrade_tag,)).fetchone()[0]
+        tags = '正常' if self.can_manage_tags else '缺少 can_manage_tags 权限，已停用'
+        white = self.db.execute('SELECT count(*) FROM whitelist').fetchone()[0]
+        self.send(self.group, f'✅ 群管运行中\n待验证：{pending}\n黑名单：{banned}\n白名单：{white} 人\n标签升级：累计 {self.upgrade_points} 分改为「{self.upgrade_tag}」，已升级 {family} 人（{tags}）\n警告累计 3 次拉黑并删除消息。')
+        return True
+
+    def moderate(self, action, target, actor=0, event='', seconds=None, note=''):
+        """统一成员管理动作服务：面板调用；公开命令不会进入这里。
+
+        调用方须已完成群、操作者与目标校验；此处再拒绝非法目标和管理员。
+        """
+        if target <= 0 or target == self.bot_id or self.admin(target):
+            self.send(self.group, '不能对管理员或本机器人执行此操作。',
+                      _delete_after=self.notice_seconds())
+            return False
+        if action == 'warn':
+            self.warn(target, event or f'manual:{actor}:{int(time.time())}',
+                      note or '管理员手动警告', actor)
+            return True
+        if action == 'mute':
+            duration = self.mute_seconds if seconds is None else int(seconds)
+            if not 1 <= duration <= 31536000:
+                self.send(self.group, '禁言时长无效，未执行。', _delete_after=self.notice_seconds())
+                return False
+            until = int(time.time()) + duration
             self.restrict(target, until)
             with self.db:
                 self.db.execute('INSERT INTO warnings(uid,mute_until) VALUES(?,?) ON CONFLICT(uid) DO UPDATE SET mute_until=excluded.mute_until', (target, until))
-            self.send(self.group, f'已禁言用户 {target}，时长 {seconds // 60} 分钟。')
-            self.audit(uid, target, 'mute', str(seconds))
-        elif cmd == '/unmute':
+            self.send(self.group, f'已禁言用户 {target}，时长 {duration // 60} 分钟。',
+                      _delete_after=self.notice_seconds())
+            self.audit(actor, target, 'mute', str(duration))
+            return True
+        if action == 'unmute':
             pending = self.db.execute("SELECT 1 FROM verification WHERE uid=? AND kind!='approved'", (target,)).fetchone()
             if pending:
-                self.send(self.group, '该成员尚未完成入群验证，请先完成验证。')
-                return True
+                self.send(self.group, '该成员尚未完成入群验证，请先完成验证。',
+                          _delete_after=self.notice_seconds())
+                return False
             self.restore(target, clear_mute=True)
             with self.db:
                 self.db.execute('UPDATE warnings SET mute_until=0 WHERE uid=?', (target,))
             self.send(self.group, f'已解除用户 {target} 的禁言。')
-            self.audit(uid, target, 'unmute')
-        elif cmd == '/resetwarn':
+            self.audit(actor, target, 'unmute')
+            return True
+        if action == 'resetwarn':
             with self.db:
                 self.db.execute('UPDATE warnings SET count=0 WHERE uid=?', (target,))
             self.send(self.group, f'已清除用户 {target} 的警告次数；现有禁言不受影响。')
-            self.audit(uid, target, 'resetwarn')
-        elif cmd == '/ban':
+            self.audit(actor, target, 'resetwarn')
+            return True
+        if action == 'ban':
             try:
-                self.blacklist_member(target, uid, ' '.join(args) or '管理员手动封禁')
+                self.blacklist_member(target, actor, note or '管理员手动封禁')
             except APIError as exc:
-                self.send(self.group, f'封禁用户 {target} 失败（{exc.code} {exc.description}），已保留黑名单记录。')
-                return True
-            self.send(self.group, f'🚫 已将用户 {target} 封禁并移出本群、加入黑名单，已请求 Telegram 删除其全部群消息。')
-        elif cmd == '/unban':
+                self.send(self.group, f'封禁用户 {target} 失败（{exc.code} {exc.description}），已保留黑名单记录。',
+                          _delete_after=self.notice_seconds())
+                return False
+            self.send(self.group, f'🚫 已将用户 {target} 封禁并移出本群、加入黑名单，已请求 Telegram 删除其全部群消息。',
+                      _delete_after=self.notice_seconds())
+            return True
+        if action == 'unban':
             if not self.blacklisted(target):
-                self.send(self.group, f'用户 {target} 不在黑名单中。')
-                return True
-            self.unblacklist_member(target, uid)
+                self.send(self.group, f'用户 {target} 不在黑名单中。',
+                          _delete_after=self.notice_seconds())
+                return False
+            self.unblacklist_member(target, actor)
             self.send(self.group, f'已解除用户 {target} 的黑名单并清零警告，可重新申请入群。')
-        elif cmd == '/white':
+            return True
+        if action == 'white':
             if self.blacklisted(target):
-                self.send(self.group, f'用户 {target} 在黑名单中，黑名单优先。如需加白名单请先在 /manage 面板解封。')
-                return True
-            note = ' '.join(args)[:100]
+                self.send(self.group, f'用户 {target} 在黑名单中，黑名单优先。如需加白名单请先在 /manage 面板解封。',
+                          _delete_after=self.notice_seconds())
+                return False
+            note = (note or '')[:100]
             pending = self.db.execute("SELECT kind FROM verification WHERE uid=? AND kind!='approved'", (target,)).fetchone()
             with self.db:
                 self.db.execute('INSERT INTO whitelist(uid,at,actor,note) VALUES(?,?,?,?) '
                                 'ON CONFLICT(uid) DO UPDATE SET note=excluded.note,actor=excluded.actor',
-                                (target, int(time.time()), uid, note))
+                                (target, int(time.time()), actor, note))
                 self.db.execute("UPDATE verification SET passed=1,kind='approved',expires=? WHERE uid=? AND kind!='approved'",
                                 (int(time.time()) + 86400, target))
             if pending:
@@ -1096,16 +1134,19 @@ class Bot:
                     if pending['kind'] != 'request' or exc.code != 400 or 'user_already_participant' not in exc.description.lower():
                         LOG.warning('Whitelist restore failed uid=%s: %s', target, exc)
             self.send(self.group, f'✅ 已将用户 {target} 加入白名单：豁免广告检测、三日异常签到禁言与入群验证。')
-            self.audit(uid, target, 'whitelist', note)
-        elif cmd == '/unwhite':
+            self.audit(actor, target, 'whitelist', note)
+            return True
+        if action == 'unwhite':
             if not self.db.execute('SELECT 1 FROM whitelist WHERE uid=?', (target,)).fetchone():
-                self.send(self.group, f'用户 {target} 不在白名单中。')
-                return True
+                self.send(self.group, f'用户 {target} 不在白名单中。',
+                          _delete_after=self.notice_seconds())
+                return False
             with self.db:
                 self.db.execute('DELETE FROM whitelist WHERE uid=?', (target,))
             self.send(self.group, f'已移除用户 {target} 的白名单，恢复正常限制。')
-            self.audit(uid, target, 'unwhitelist')
-        return True
+            self.audit(actor, target, 'unwhitelist')
+            return True
+        raise ValueError(f'未知管理动作：{action}')
 
     def reward_invite(self, user, inviter=None, timestamp=None):
         if user.get('is_bot') or user['id'] == self.bot_id or self.blacklisted(user['id']):
@@ -1204,7 +1245,7 @@ class Bot:
                 return
             if msg['chat'].get('type') == 'private' and 'message' in update and (self.rate_command(msg) or self.bin_command(msg)):
                 return
-            if msg['chat'].get('type') == 'private' and 'message' in update and self.command(msg, update['update_id']):
+            if msg['chat'].get('type') == 'private' and 'message' in update and self.command(msg):
                 return
             if msg['chat']['id'] != self.group:
                 if msg['chat'].get('type') == 'private':
@@ -1241,7 +1282,7 @@ class Bot:
                 return
             if 'message' in update and (self.rate_command(msg) or self.bin_command(msg)):
                 return
-            if 'message' in update and self.command(msg, update['update_id']):
+            if 'message' in update and self.command(msg):
                 return
             uid = msg['from']['id']
             if uid == self.bot_id or msg['from'].get('is_bot'):
@@ -1362,7 +1403,8 @@ class Bot:
         if not uid:
             return True
         if len(tokens) != 1:
-            self.send(chat['id'], '设置现已改为按钮操作，请直接发送 /settings 。')
+            self.send(chat['id'], '设置现已改为按钮操作，请直接发送 /settings 。',
+                      _delete_after=self.notice_seconds())
             return True
         if self._settings_owner_status(self, uid):
             self._show_settings_panel(uid, self)

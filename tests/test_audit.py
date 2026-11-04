@@ -10,7 +10,7 @@ class Tests(unittest.TestCase):
             for i in range(105):
                 self.bot.db.execute('INSERT INTO audit(at,actor,target,action,detail) VALUES(?,?,?,?,?)',(1,1,2 if i%2 else 3,f'event{i:03}', '<>&😀'*25))
     def run_command(self,text):
-        self.bot.command({'chat':{'id':-1},'from':{'id':1},'text':text,'reply_to_message':{'from':{'id':2}}},1)
+        self.bot.command({'chat':{'id':-1},'from':{'id':1},'text':text,'reply_to_message':{'from':{'id':2}}})
         return [d['text'] for m,d in self.api.calls if m=='sendMessage']
     def test_all_latest_100_split_even_when_replying(self):
         texts=self.run_command('/audit');combined='\n'.join(texts)

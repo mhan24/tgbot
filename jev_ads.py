@@ -143,7 +143,8 @@ class JevAds:
             return False
         chat = msg.get('chat', {})
         def reply(text):
-            self.bot.send(chat['id'], text)
+            # Refusals and submission errors keep the longer failure lifetime.
+            self.bot.send(chat['id'], text, _delete_after=self.bot.notice_seconds())
         if chat.get('id') != self.bot.group:
             reply('请在管理群内回复目标消息并发送 /report。'); return True
         user = msg.get('from', {})
@@ -176,7 +177,7 @@ class JevAds:
                   'clear': '模型未判为广告，不处罚', 'confirmed': '已确认并警告', 'approving': '正在执行确认结果',
                   'error': '模型请求失败，未作处罚', 'dismissed': '管理员已驳回', 'expired': '投票已过期',
                   'superseded': '消息已修改，请重新回复提交', 'exempt': '发送者已豁免'}
-        reply(f'举报 #{row["id"]}：{labels.get(row["state"], row["state"])}。\n'+self.model_feedback(row))
+        self.bot.send(chat['id'], f'举报 #{row["id"]}：{labels.get(row["state"], row["state"])}。\n'+self.model_feedback(row))
         self.bot.audit(uid, row['uid'], 'jev_report', str(row['id']))
         return True
 

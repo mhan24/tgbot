@@ -1,6 +1,6 @@
 # 消息保留与自动删除规范
 
-版本：1.1 · 2026-11-04
+版本：1.2 · 2026-11-04
 
 本文是新增、修改机器人功能时必须遵守的消息生命周期规范。当前生产规则由用户确认，本文不会因为模型评估而自行改变已确认的时间。代码接入要求见第 4 节，合入检查见第 6 节。
 
@@ -67,17 +67,17 @@
 
 ### 4.1 群内普通反馈
 
-优先使用 `Bot.send()`。默认成功提示随群配置清理；新功能失败提示应**显式**设置 120 秒，不能依赖中文关键词判断：
+优先使用 `Bot.send()`。默认成功提示随群配置清理；失败、警告和处罚通知必须**显式**给出 `_delete_after=bot.notice_seconds()`，文案本身不参与任何时长判断：
 
 ```python
-bot.send(bot.group, '操作成功。')
+bot.send(bot.group, '操作成功。')                                  # 群常规时长
 bot.send(bot.group, '积分不足，未扣分。请获得足够积分后重试。',
-         _delete_after=120 if bot.delete_after > 0 else 0)
+         _delete_after=bot.notice_seconds())                       # 失败提示 120 秒
 ```
 
-`retention.notice_delay()` 是现有短通知的兼容兜底，按文案判断，且只对少于 700 字的消息应用失败时长。它不构成可靠的业务分类器。新增长错误、动态文案、国际化文案必须显式指定类别/时间。
+`bot.notice_seconds()` 在群清理关闭（`DELETE_AFTER_SECONDS=0`）时返回 0，保持“关闭自动清理”的语义。代码不按中文关键词、文案长度猜测类别；同一句文案在成功与失败路径上的时长由调用方声明。
 
-普通直接 `Bot.call('sendMessage', ...)` 不经过 `Bot.send()` 的文案兜底；要么改用 `send()`，要么显式设置 `_delete_after`。不要绕过封装直接使用 `api.call()` 发送群消息。
+普通直接 `Bot.call('sendMessage', ...)` 不经过 `Bot.send()` 的默认时长；要么改用 `send()`，要么显式设置 `_delete_after`。不要绕过封装直接使用 `api.call()` 发送群消息。
 
 ### 4.2 活动、公告和交互卡片
 
@@ -161,7 +161,7 @@ bot.send(uid, final_preview)
 - [ ] 使用适当的自动化测试验证保留、到期、豁免、失败重试和跨群隔离？
 - [ ] 若新增例外，是否明确获准并同步本文、帮助和功能文档？
 
-相关实现：`retention.py`、`Bot.send/call/schedule_delete/sweep_deletions`、`private_steps`；测试见 `tests/test_retention.py` 及各功能测试。
+相关实现：`retention.py`（`NOTICE_SECONDS`）、`Bot.notice_seconds/send/call/schedule_delete/sweep_deletions`、`private_steps`；测试见 `tests/test_retention.py` 及各功能测试。
 
 ### 邀请积分接入检查（2026-10-30）
 
@@ -180,6 +180,10 @@ bot.send(uid, final_preview)
 ### 关键词积分、限时夺宝与 AI 问答下线（2026-11-04）
 
 三个功能的命令、私聊填写流程、群内卡片、开奖公告、AI 回答及后台任务全部移除；`keyword_*`、`treasure*`、`ai_*`、`ai_media`、`chat_history` 表不再创建和使用，旧库中的存量表不读取也不删除。历史保留时长（夺宝 24 小时公告、关键词卡片 120 秒、AI 回答 600 秒）从时长表中移除。用户源消息和既有群内消息不作批量清理；仍在删除队列中的历史任务按已登记时长继续执行。拉黑后的消息删除改为仅依赖 Telegram `revoke_messages`，不再基于本地聊天记录补删；Jev 确认广告后不再清理聊天记录表。没有新增保留时长。
+
+### 文案兜底与旧格式移除（2026-11-04）
+
+`retention.notice_delay()` 按中文关键词猜测时长已删除，代码不再根据文案决定保留时间；群内失败、警告和处罚通知一律显式传入 `_delete_after=Bot.notice_seconds()`（群清理关闭时为 0）。同时移除旧按钮回调格式、旧管理命令文本和旧设置键的兼容读取：过期按钮只提示失效，不再执行业务；无法解析或属于已下线功能的 `group_settings` 行在启动时删除。本次没有新增或修改保留时长表中的数值。
 
 ### 十连签到与五星播报接入检查（2026-10-30）
 

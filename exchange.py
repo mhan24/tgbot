@@ -7,6 +7,8 @@ import re
 import time
 import urllib.request
 
+CST = timezone(timedelta(hours=8))
+
 
 class RateError(Exception):
     pass
@@ -44,6 +46,9 @@ class Exchange:
                     data = json.load(response)
                 if data.get('base') != 'USD' or not isinstance(data.get('rates'), dict):
                     raise ValueError()
+                # The upstream contract requires a numeric timestamp; no fallback date field.
+                if not isinstance(data.get('timestamp'), (int, float)) or isinstance(data.get('timestamp'), bool):
+                    raise ValueError()
                 for value in data['rates'].values():
                     rate = Decimal(str(value))
                     if not rate.is_finite() or rate <= 0:
@@ -63,9 +68,5 @@ class Exchange:
             ratio = Decimal(str(rates[target])) / Decimal(str(rates[source]))
             total = amount * ratio
             text = f'{number(amount)} {source} ≈ <b>{number(total)} {target}</b>\n1 {source} ≈ {number(ratio)} {target}'
-        stamp = data.get('timestamp')
-        try:
-            date = datetime.fromtimestamp(float(stamp), timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M（北京时间）')
-        except (TypeError, ValueError, OverflowError, OSError):
-            date = str(data.get('date') or '未知')
+        date = datetime.fromtimestamp(float(data['timestamp']), CST).strftime('%Y-%m-%d %H:%M（北京时间）')
         return text + '\n数据更新：' + html.escape(date) + '\n来源：ExchangeRate.fun · 参考汇率'

@@ -20,9 +20,14 @@ class Tests(unittest.TestCase):
         self.assertEqual(results, [3] * 9 + [4])
         self.assertEqual((pity4, pity5, guaranteed), (0, 10, 0))
         self.assertEqual(self.points.checkin(self.user, 'a', 100000)[0:3], (1, 'replay', results))
-        self.assertEqual(self.points.award(self.user, 'checkin', 'b', 100000)[0:2], (0, 'limit'))
+        self.assertEqual(self.points.checkin(self.user, 'b', 100000)[0:2], (0, 'limit'))
         self.assertEqual(self.points.stats(2, 100000)[0], 1)
         self.assertEqual(self.db.execute('SELECT count(*) FROM checkin_draws').fetchone()[0], 1)
+
+    def test_award_rejects_checkin_kind(self):
+        with self.assertRaises(ValueError):
+            self.points.award(self.user, 'checkin', 'x', 100000)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM point_events').fetchone()[0], 0)
 
     def test_five_star_standard_then_guaranteed_up(self):
         rolls = [0, 999999] + [999999, 999999] * 9
@@ -146,8 +151,8 @@ class Tests(unittest.TestCase):
         before=datetime(2026,9,15,15,59,59,tzinfo=timezone.utc).timestamp()
         self.assertEqual(self.points.day(before),'2026-09-15')
         self.assertEqual(self.points.day(before+1),'2026-09-16')
-        self.assertEqual(self.points.award(self.user,'checkin','a',before)[1],'added')
-        self.assertEqual(self.points.award(self.user,'checkin','b',before+1)[1],'added')
+        self.assertEqual(self.points.checkin(self.user,'a',before)[1],'added')
+        self.assertEqual(self.points.checkin(self.user,'b',before+1)[1],'added')
     def test_duplicate_message_and_persistence(self):
         self.points.award(self.user,'message','a',100000)
         other=Points(self.db);other.award(self.user,'message','a',100000)
@@ -296,7 +301,7 @@ class Tests(unittest.TestCase):
         self.assertIn('start=milestones',reply['reply_markup']['inline_keyboard'][0][0]['url'])
         private_msg={'chat':{'id':2,'type':'private'},'from':self.user,'message_id':51,'text':'/start milestones'}
         bot.points_command(private_msg)
-        self.assertIn('达标榜',[d for m,d in api.calls if m=='sendMessage'][-1]['text'])
+        self.assertIn('出金榜',[d for m,d in api.calls if m=='sendMessage'][-1]['text'])
 
     def test_chinese_points_aliases_work_without_replacing_english_commands(self):
         api=FakeAPI();bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)

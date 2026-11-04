@@ -13,7 +13,7 @@ class Tests(unittest.TestCase):
 
     def panel(self, target=2, private=False):
         self.bot.command({'text': f'/manage {target}', 'from': {'id': 1},
-                          'chat': {'id': 1 if private else -1}}, 1)
+                          'chat': {'id': 1 if private else -1}})
         return self.bot.db.execute('SELECT * FROM moderation_panels ORDER BY rowid DESC LIMIT 1').fetchone()
 
     def click(self, row, action, actor=1, gid=-1, chat=None):
@@ -23,7 +23,7 @@ class Tests(unittest.TestCase):
 
     def test_old_commands_removed(self):
         for cmd in ('warn', 'warnings', 'resetwarn', 'mute', 'unmute', 'ban', 'unban', 'white', 'unwhite', 'whitelist'):
-            self.assertFalse(self.bot.command({'text': f'/{cmd} 2', 'from': {'id': 1}}, 1))
+            self.assertFalse(self.bot.command({'text': f'/{cmd} 2', 'from': {'id': 1}}))
         self.assertFalse(any(m in ('banChatMember', 'restrictChatMember') for m, _ in self.api.calls))
 
     def test_duplicate_click_warns_only_once(self):

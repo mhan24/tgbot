@@ -3,7 +3,7 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 from bot import Bot
-from retention import notice_delay
+from retention import NOTICE_SECONDS
 from test_bot import FakeAPI
 
 
@@ -12,20 +12,51 @@ class Tests(unittest.TestCase):
         self.api=FakeAPI()
         self.bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},self.api,sqlite3.connect(':memory:'))
         self.addCleanup(self.bot.db.close)
-    def test_notice_lifetimes_and_kept_cards(self):
+    def due(self):
+        return {row['message_id']: row['due'] for row in self.bot.db.execute('SELECT * FROM deletions')}
+    def test_group_defaults_and_explicit_overrides(self):
         with patch('bot.time.time',return_value=100):
             success=self.bot.send(-1,'✅ 签到成功，获得 2 积分！')
-            failure=self.bot.send(-1,'今天已经签到过了。北京时间零点后可再次签到。')
-            penalty=self.bot.send(-1,'⚠️ 该成员 警告 1/3：头像不可见')
-            kept=self.bot.send(-1,'❌ 开奖公告测试',keep=True)
-            ai=self.bot.send(-1,'普通回答',_delete_after=600)
-        due=dict(self.bot.db.execute('SELECT message_id,due FROM deletions'))
-        self.assertEqual(due[success['message_id']],130)
-        self.assertEqual(due[failure['message_id']],220)
-        self.assertEqual(due[penalty['message_id']],220)
-        self.assertNotIn(kept['message_id'],due)
-        self.assertEqual(due[ai['message_id']],700)
-        self.assertEqual(notice_delay('✅ 群管运行中\n警告累计 3 次拉黑并删除消息。',30),30)
+            failure=self.bot.send(-1,'今天已经签到过了。',_delete_after=self.bot.notice_seconds())
+            penalty=self.bot.send(-1,'⚠️ 该成员 警告 1/3：头像不可见',_delete_after=self.bot.notice_seconds())
+            kept=self.bot.send(-1,'开奖公告测试',keep=True)
+            long_lived=self.bot.send(-1,'自定义时长',_delete_after=600)
+        queued=self.due()
+        self.assertEqual(queued[success['message_id']],130)
+        self.assertEqual(queued[failure['message_id']],100+NOTICE_SECONDS)
+        self.assertEqual(queued[penalty['message_id']],100+NOTICE_SECONDS)
+        self.assertNotIn(kept['message_id'],queued)
+        self.assertEqual(queued[long_lived['message_id']],700)
+    def test_wording_never_changes_the_lifetime(self):
+        # No keyword guessing: identical texts keep their own explicit category.
+        with patch('bot.time.time',return_value=100):
+            failed=self.bot.send(-1,'暂时无法处理，请稍后重试。')
+            plain=self.bot.send(-1,'普通提示',_delete_after=self.bot.notice_seconds())
+        queued=self.due()
+        self.assertEqual(queued[failed['message_id']],130)   # group default, not 120
+        self.assertEqual(queued[plain['message_id']],220)    # explicit failure notice
+    def test_duplicate_checkin_notice_has_explicit_failure_lifetime(self):
+        self.bot.username='testbot'
+        self.bot.avatar_visible=lambda uid, **kwargs: True
+        msg={'chat':{'id':-1,'type':'supergroup'},'from':{'id':2,'first_name':'A'},
+             'message_id':70,'date':1000,'text':'/checkin'}
+        with patch('bot.time.time',return_value=100):
+            self.bot.points_command(msg)
+            result_id=self.api.sent
+            self.bot.points_command(dict(msg, message_id=71))
+            duplicate_id=self.api.sent
+        queued=self.due()
+        self.assertEqual(queued[result_id],130)
+        self.assertEqual(queued[duplicate_id],100+NOTICE_SECONDS)
+        self.assertIn('今天已经签到过了',
+                      [d['text'] for m,d in self.api.calls if m=='sendMessage'][-1])
+
+    def test_notice_disabled_with_group_cleanup(self):
+        self.bot.delete_after=0
+        self.assertEqual(self.bot.notice_seconds(),0)
+        with patch('bot.time.time',return_value=100):
+            self.bot.send(-1,'失败提示',_delete_after=self.bot.notice_seconds())
+        self.assertEqual(self.due(),{})
     def test_private_only_completed_bot_steps_are_deleted(self):
         with patch('bot.time.time',return_value=100):
             first=self.bot.send(5,'请填写奖品')

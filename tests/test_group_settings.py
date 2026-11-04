@@ -92,6 +92,26 @@ class GroupSettingsTests(unittest.TestCase):
         self.assertFalse(self.bot.group_settings_reply(self.message(1, '3')))
         self.assertEqual(self.bot.message_points, 1)
 
+    def test_obsolete_or_invalid_stored_settings_are_deleted_on_startup(self):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO group_settings VALUES('AI_MODEL','gpt')")
+            self.db.execute("INSERT OR REPLACE INTO group_settings VALUES('CHECKIN_MIN','1')")
+            self.db.execute("INSERT OR REPLACE INTO group_settings VALUES('MESSAGE_POINTS','abc')")
+            self.db.execute("INSERT OR REPLACE INTO group_settings VALUES('JEV_ENABLED','yes')")
+        reloaded = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, self.db)
+        keys = {row[0] for row in self.db.execute('SELECT key FROM group_settings')}
+        self.assertEqual(keys, set())
+        self.assertEqual(reloaded.message_points, 1)
+        self.assertEqual(reloaded.upgrade_points, 50)
+        self.assertTrue(reloaded.setting_values['JEV_ENABLED'])
+
+    def test_bool_settings_accept_only_canonical_tokens(self):
+        for token, expected in (('1', True), ('on', True), ('0', False), ('off', False)):
+            self.assertEqual(self.bot.parse_group_setting('JEV_ENABLED', token), expected, token)
+        for token in ('yes', 'true', '开启', '关闭', 'no'):
+            with self.assertRaises(ValueError):
+                self.bot.parse_group_setting('JEV_ENABLED', token)
+
     def test_model_setting_removed_and_old_button_rejected(self):
         for key in ('AI_MODEL', 'CHECKIN_MIN', 'CHECKIN_MAX', 'AI_ENABLED', 'AI_COOLDOWN_SECONDS',
                     'HISTORY_MESSAGES', 'HISTORY_CONTEXT'):

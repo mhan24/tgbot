@@ -10,9 +10,12 @@ class RankingTests(unittest.TestCase):
         with self.bot.db:
             self.bot.db.executemany('INSERT INTO point_users VALUES(?,?,?)',
                 [(i,'@User <>& '*16,102-i) for i in range(1,102)])
-    def click(self,page,uid=2,chat=2):
-        self.bot.handle({'callback_query':{'id':'q','from':{'id':uid},'data':f'rank:2:{page}',
+    def click(self,page,uid=2,chat=2,data=None):
+        self.bot.handle({'callback_query':{'id':'q','from':{'id':uid},'data':data or f'rank:-1:{uid}:{page}',
             'message':{'message_id':8,'chat':{'id':chat,'type':'private'}}}})
+    def test_legacy_callback_without_group_is_rejected(self):
+        self.click(1,data='rank:2:1')
+        self.assertFalse(any(m=='editMessageText' for m,d in self.api.calls))
     def test_pages_and_boundary_clamping(self):
         for page,count,buttons in [(0,50,1),(1,50,2),(2,1,1),(99,1,1),(-1,50,1)]:
             text,markup=self.bot.ranking_page(2,page)

@@ -32,6 +32,12 @@ class Tests(unittest.TestCase):
         with patch('exchange.urllib.request.urlopen', return_value=io.BytesIO(b'{"base":"USD","rates":{"CNY":-1}}')):
             with self.assertRaises(RateError): self.exchange.convert(['USD','CNY'])
         self.assertEqual(self.db.execute('SELECT count(*) FROM exchange_cache').fetchone()[0],0)
+    def test_missing_timestamp_is_rejected_without_cache(self):
+        body = json.dumps({'base':'USD','date':'2026-11-04','rates':{'CNY':7}}).encode()
+        with patch('exchange.urllib.request.urlopen', return_value=io.BytesIO(body)):
+            with self.assertRaises(RateError): self.exchange.convert(['USD','CNY'])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM exchange_cache').fetchone()[0],0)
+
     def test_group_private_dispatch_and_cleanup(self):
         api=FakeAPI()
         bot=Bot({'GROUP_ID':'-1','CHANNEL_ID':'-2'},api,self.db)

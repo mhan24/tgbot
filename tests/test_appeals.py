@@ -11,8 +11,14 @@ class Tests(unittest.TestCase):
     def msg(self,text):
         return {'chat':{'id':2,'type':'private'},'from':{'id':2},'text':text}
     def submit(self):self.bot.appeals.command(self.msg('/appeal 希望重新加入'))
-    def click(self,uid=1,action='approve'):
-        self.bot.appeals.callback({'id':'q','from':{'id':uid},'data':f'appeal:{action}:1'})
+    def click(self,uid=1,action='approve',data=None):
+        self.bot.appeals.callback({'id':'q','from':{'id':uid},
+                                   'data':data or f'appeal:{action}:{self.bot.group}:1'})
+    def test_legacy_callback_format_is_rejected(self):
+        self.submit()
+        self.click(data='appeal:approve:1')
+        self.assertTrue(self.bot.blacklisted(2))
+        self.assertEqual(self.bot.db.execute('SELECT state FROM appeals').fetchone()[0],'pending')
     def test_approve_and_duplicate(self):
         self.submit();self.submit()
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM appeals').fetchone()[0],1)

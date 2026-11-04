@@ -206,7 +206,7 @@ class JevTests(unittest.TestCase):
         self.assertIn('/report',text)
         for cmd in ('/ads','/adreview','/adok','/adno','/adwords'):
             self.assertNotIn(cmd,text)
-            self.assertFalse(self.bot.command({'text':cmd,'from':{'id':1}},1))
+            self.assertFalse(self.bot.command({'text':cmd,'from':{'id':1}}))
 
     def test_api_contract_and_invalid_probability(self):
         valid = {'model':'jev-1.13.0','answers':{'advertising':{'type':'choice','choice':'ad','probabilities':{'ad':.99,'normal':.01}}}}
