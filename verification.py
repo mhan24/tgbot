@@ -20,6 +20,8 @@ DELIVERY_ATTEMPTS = 3
 DELIVERY_RETRY_SECONDS = 30
 FINISH_RETRY_SECONDS = 30
 RESTORE_ATTEMPTS = 5
+APPROVE_ATTEMPTS = 5
+FINISH_ATTEMPTS = 10
 
 # 这些描述说明对象或申请已经不存在，重试没有意义。
 SETTLED_ERRORS = ('user is deactivated', 'user_id_invalid', 'hide_requester_missing',
@@ -47,6 +49,9 @@ class Verification:
           send_attempts INTEGER NOT NULL DEFAULT 0,
           restored INTEGER NOT NULL DEFAULT 0,
           restore_attempts INTEGER NOT NULL DEFAULT 0,
+          approved INTEGER NOT NULL DEFAULT 0,
+          approve_attempts INTEGER NOT NULL DEFAULT 0,
+          finish_attempts INTEGER NOT NULL DEFAULT 0,
           retry_at INTEGER NOT NULL DEFAULT 0,
           updated INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS verification_prompts(
@@ -58,7 +63,7 @@ class Verification:
     REQUIRED_COLUMNS = frozenset({
         'uid', 'chat', 'kind', 'nonce', 'question', 'answer', 'options', 'expires',
         'attempts', 'state', 'sent', 'send_attempts', 'restored', 'restore_attempts',
-        'retry_at', 'updated'})
+        'approved', 'approve_attempts', 'finish_attempts', 'retry_at', 'updated'})
 
     def require_schema(self):
         """不接受其他版本的验证表：没有迁移分支，结构不符时直接拒绝启动。"""
@@ -91,7 +96,7 @@ class Verification:
         if row and row['state'] == 'passed' and row['expires'] > now:
             # 已验证过的成员重新申请入群，不再重复验证。
             if kind == 'request':
-                self._approve(uid)
+                self._approve(row)
             return
         if row and row['state'] == 'challenge' and row['expires'] > now and row['kind'] == kind:
             if not row['sent'] and row['retry_at'] <= now:
@@ -162,19 +167,19 @@ class Verification:
             self.db.execute("UPDATE verification SET state='passed', expires=?, updated=? WHERE uid=?",
                             (now + PASSED_TTL, now, uid))
         if row['kind'] == 'request':
-            try:
-                self.bot.call('approveChatJoinRequest', chat_id=self.bot.group, user_id=uid)
-            except APIError as exc:
-                if not (exc.permanent and 'user_already_participant' in exc.description.lower()):
-                    # 申请已被撤销或过期：清掉记录，让成员可以重新申请。
-                    with self.db:
-                        self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
-                    self.bot.audit(0, uid, 'verification_approve_failed')
-                    self._answer(query, '验证已通过，但入群申请已失效，请重新申请入群。')
-                    return
+            outcome = self._approve(row)
+            if outcome is None:
+                # 申请已被撤销、过期或用户已不存在：记录已清理，可以重新申请。
+                self._answer(query, '验证已通过，但入群申请已失效，请重新申请入群。')
+                return
             self.bot.audit(0, uid, 'verified')
-            self._answer(query, '验证成功，欢迎入群！')
-            self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+            if outcome:
+                self._answer(query, '验证成功，欢迎入群！')
+                self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+            else:
+                # 验证已通过，但批准入群暂时失败：不谎报成功，后台继续重试。
+                self._answer(query, '验证已通过，正在为你提交入群申请，请稍候。')
+                self._edit_card(query, '✅ 已通过验证，正在提交入群申请。')
             return
         self.bot.audit(0, uid, 'verified')
         if self._restore(uid):
@@ -191,7 +196,8 @@ class Verification:
         now = int(time.time())
         for row in self.db.execute(
                 "SELECT * FROM verification WHERE state='challenge' AND expires<? "
-                "AND (retry_at=0 OR retry_at<=?)", (now, now)).fetchall():
+                "AND finish_attempts<? AND (retry_at=0 OR retry_at<=?)",
+                (now, FINISH_ATTEMPTS, now)).fetchall():
             self._fail(row, 'timeout')
         for row in self.db.execute(
                 "SELECT * FROM verification WHERE state='challenge' AND sent=0 AND expires>=? "
@@ -200,6 +206,11 @@ class Verification:
                 self._fail(row, 'delivery_failed')
             else:
                 self._deliver(row)
+        for row in self.db.execute(
+                "SELECT * FROM verification WHERE state='passed' AND kind='request' AND approved=0 "
+                "AND approve_attempts<? AND retry_at<=?",
+                (APPROVE_ATTEMPTS, now)).fetchall():
+            self._approve(row)
         for row in self.db.execute(
                 "SELECT uid,restore_attempts FROM verification WHERE state='passed' AND restored=0 "
                 "AND restore_attempts<? AND retry_at<=?",
@@ -216,6 +227,16 @@ class Verification:
         answer = a + b
         options = [answer, answer + 1, answer + 2, answer - 1]
         secrets.SystemRandom().shuffle(options)
+        # 先落库再禁言：即使禁言或投递失败，也存在可追踪、可重试的记录。
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO verification(uid,chat,kind,nonce,question,answer,options,expires,"
+                "attempts,state,sent,send_attempts,restored,restore_attempts,approved,approve_attempts,"
+                "finish_attempts,retry_at,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,0,'challenge',0,0,0,0,0,0,0,0,?)",
+                (uid, chat, kind, secrets.token_hex(6), f'{a} + {b}', answer,
+                 json.dumps(options), now + self.bot.verify_seconds, now))
+        row = self.db.execute('SELECT * FROM verification WHERE uid=?', (uid,)).fetchone()
         if kind == 'member':
             try:
                 # 直接进群：先禁言，验证通过后再恢复发言。
@@ -223,15 +244,10 @@ class Verification:
             except APIError as exc:
                 LOG.warning('Cannot restrict joining member uid=%s code=%s', uid, exc.code)
                 self.bot.audit(0, uid, 'verification_restrict_failed')
+                # 无法禁言就不能让未验证成员留在群里发言。
+                self._fail(row, 'restrict_failed')
                 return
-        with self.db:
-            self.db.execute(
-                "INSERT OR REPLACE INTO verification(uid,chat,kind,nonce,question,answer,options,expires,"
-                "attempts,state,sent,send_attempts,restored,restore_attempts,retry_at,updated) "
-                "VALUES(?,?,?,?,?,?,?,?,0,'challenge',0,0,0,0,0,?)",
-                (uid, chat, kind, secrets.token_hex(6), f'{a} + {b}', answer,
-                 json.dumps(options), now + self.bot.verify_seconds, now))
-        self._deliver(self.db.execute('SELECT * FROM verification WHERE uid=?', (uid,)).fetchone())
+        self._deliver(row)
 
     def _deliver(self, row):
         uid = row['uid']
@@ -271,11 +287,15 @@ class Verification:
             self.bot.call(method, **payload)
         except APIError as exc:
             if not (exc.permanent and self._settled(exc)):
+                attempts = row['finish_attempts'] + 1
+                LOG.warning('Verification conclusion deferred uid=%s reason=%s code=%s attempts=%s',
+                            uid, reason, exc.code, attempts)
                 with self.db:
-                    self.db.execute('UPDATE verification SET retry_at=? WHERE uid=?',
-                                    (int(time.time()) + FINISH_RETRY_SECONDS, uid))
-                LOG.warning('Verification conclusion deferred uid=%s reason=%s code=%s',
-                            uid, reason, exc.code)
+                    self.db.execute('UPDATE verification SET finish_attempts=?, retry_at=? WHERE uid=?',
+                                    (attempts, int(time.time()) + FINISH_RETRY_SECONDS, uid))
+                if attempts >= FINISH_ATTEMPTS:
+                    # 持续失败不再重试，保留记录并写审计，等待人工处理。
+                    self.bot.audit(0, uid, 'verification_conclusion_gaveup:' + reason)
                 return
         with self.db:
             self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
@@ -292,12 +312,23 @@ class Verification:
             LOG.warning('Restore permissions failed uid=%s code=%s attempts=%s',
                         uid, exc.code, attempts)
             if attempts >= RESTORE_ATTEMPTS:
-                # 达到上限后不再重试：成员仍被限制，留下审计供人工解除。
+                # 达到上限后不再重试：成员仍被限制，写审计并在群里请管理员接手。
                 self.bot.audit(0, uid, 'verification_restore_gaveup')
+                self._notify_admin(uid)
             return False
         with self.db:
             self.db.execute('UPDATE verification SET restored=1, retry_at=0 WHERE uid=?', (uid,))
         return True
+
+    def _notify_admin(self, uid):
+        """恢复发言持续失败时提醒管理员，避免成员被静默禁言。"""
+        try:
+            self.bot.send(self.bot.group,
+                          f'⚠️ 成员 <a href="tg://user?id={uid}">UID {uid}</a> 已通过验证，'
+                          '但机器人多次恢复发言失败，请在群设置中手动解除限制。',
+                          _delete_after=self.bot.notice_seconds())
+        except APIError as exc:
+            LOG.warning('Admin notice failed uid=%s code=%s', uid, exc.code)
 
     def _reject(self, uid, kind, reason):
         method = 'declineChatJoinRequest' if kind == 'request' else 'banChatMember'
@@ -310,12 +341,35 @@ class Verification:
                 return
         self.bot.audit(0, uid, reason)
 
-    def _approve(self, uid):
+    def _approve(self, row):
+        """批准入群：True=已批准，False=稍后重试，None=申请已失效。"""
+        uid = row['uid']
         try:
             self.bot.call('approveChatJoinRequest', chat_id=self.bot.group, user_id=uid)
         except APIError as exc:
-            if not (exc.permanent and 'user_already_participant' in exc.description.lower()):
-                LOG.warning('Approve join request failed uid=%s code=%s', uid, exc.code)
+            description = exc.description.lower()
+            if exc.permanent and 'user_already_participant' in description:
+                pass
+            elif exc.permanent and self._settled(exc):
+                # 申请已撤销/过期/用户已注销：清掉记录，允许重新申请。
+                with self.db:
+                    self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
+                self.bot.audit(0, uid, 'verification_approve_expired')
+                return None
+            else:
+                attempts = row['approve_attempts'] + 1
+                LOG.warning('Approve join request failed uid=%s code=%s attempts=%s',
+                            uid, exc.code, attempts)
+                with self.db:
+                    self.db.execute('UPDATE verification SET approve_attempts=?, retry_at=? WHERE uid=?',
+                                    (attempts, int(time.time()) + FINISH_RETRY_SECONDS, uid))
+                if attempts >= APPROVE_ATTEMPTS:
+                    # 申请仍在 Telegram 侧挂起，需要人工批准或撤销。
+                    self.bot.audit(0, uid, 'verification_approve_gaveup')
+                return False
+        with self.db:
+            self.db.execute('UPDATE verification SET approved=1, retry_at=0 WHERE uid=?', (uid,))
+        return True
 
     def _is_admin(self, uid):
         if uid <= 0:
@@ -337,7 +391,10 @@ class Verification:
 
     def limit_text(self):
         seconds = self.bot.verify_seconds
-        return f'{seconds // 60} 分钟' if seconds >= 60 else f'{seconds} 秒'
+        if seconds < 60:
+            return f'{seconds} 秒'
+        minutes, rest = divmod(seconds, 60)
+        return f'{minutes} 分钟' if not rest else f'{minutes} 分 {rest} 秒'
 
     def _keyboard(self, row):
         options = json.loads(row['options'])

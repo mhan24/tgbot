@@ -96,6 +96,15 @@ class CoreTests(unittest.TestCase):
         self.bot.handle(self.message(2, '/unknown', chat=2, chat_type='private'))
         self.assertIn('/help', self.api.texts()[-1])
 
+    def test_private_replies_only_to_unknown_commands(self):
+        self.bot.handle(self.message(1, '你好', chat=2, chat_type='private'))
+        self.assertEqual(self.api.calls, [])
+        self.bot.handle(self.message(2, '/unknown', chat=2, chat_type='private'))
+        self.assertIn('/help', self.api.texts()[-1])
+        before = len(self.api.calls)
+        self.bot.handle(self.message(3, '/help@otherbot', chat=2, chat_type='private'))
+        self.assertEqual(len(self.api.calls), before)
+
     def test_unknown_group_command_points_to_help_with_failure_lifetime(self):
         with patch('bot.time.time', return_value=1000):
             self.bot.handle(self.message(1, '/checkin'))

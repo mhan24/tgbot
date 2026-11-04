@@ -65,14 +65,18 @@
 
 | 情况 | 行为 |
 |---|---|
-| 验证卡片发送失败（网络/限流） | 最多重试 3 次（间隔 30 秒）；仍失败则拒绝申请或保留禁言状态 |
+| 验证卡片发送失败（网络/限流） | 最多重试 3 次（间隔 30 秒）；仍失败则拒绝申请或移出成员 |
+| 批准入群暂时失败（网络/限流/权限） | 保留通过状态，后台每 30 秒重试批准，最多 5 次；期间提示"正在提交入群申请" |
+| 批准入群持续失败 | 停止重试并写 `verification_approve_gaveup` 审计；申请仍在 Telegram 侧挂起，需人工批准或撤销 |
+| 入群申请已撤销/过期/用户已注销 | 清除本地记录并写 `verification_approve_expired` 审计，提示重新申请 |
+| 无法禁言直接进群的成员 | 写 `verification_restrict_failed` 审计并把该成员移出，不允许未验证成员留在群里 |
 | 私聊无法发起（用户未与机器人互动） | 直接拒绝申请并记录审计 |
-| 拒绝申请或移出成员时权限不足 | 保留记录，每 30 秒重试；权限恢复后继续 |
+| 拒绝申请或移出成员时权限不足 | 保留记录并标记失效，每 30 秒重试，最多 10 次；仍未成功则写 `verification_conclusion_gaveup` 审计并停止重试 |
 | 申请已过期或被撤销 | 清除本地记录，提示用户重新申请 |
-| 恢复发言权限失败 | 保留通过状态并每 30 秒重试，最多 5 次；仍未成功则停止重试并写 `verification_restore_gaveup` 审计，成员需人工解除限制 |
+| 恢复发言权限失败 | 保留通过状态并每 30 秒重试，最多 5 次；仍未成功则写 `verification_restore_gaveup` 审计，并在群里提醒管理员手动解除限制 |
 | 禁言失败（无法限制新成员） | 不发验证卡片，记录 `verification_restrict_failed` 审计 |
 
-Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`verification_restrict_failed`、`verification_approve_failed`、`verification_restore_gaveup`、`reject_bot`、`allow_invited_bot`、`delete_giveup`、`update_failed` 等动作。
+Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外部调用失败保存为可重试状态；审计表记录 `verified`、`verification_timeout`、`verification_attempts`、`verification_delivery_failed`、`verification_restrict_failed`、`verification_approve_expired`、`verification_approve_gaveup`、`verification_restore_gaveup`、`verification_conclusion_gaveup`、`reject_bot`、`allow_invited_bot`、`delete_giveup`、`update_failed` 等动作。
 
 ## 6. 限制
 
@@ -80,3 +84,5 @@ Telegram 调用与 SQLite 不构成同一事务：状态以数据库为准，外
 - 必须把机器人设为群和频道的管理员：频道里要能读成员状态，群里要能删消息、限制成员、邀请成员。
 - 群未开启“入群申请”时，所有正常邀请都会走“先禁言再群内验证”的路径。
 - 机器人不能阻止管理员手动把未验证用户设为管理员；成为管理员后不再受验证约束。
+- 管理员手动删除群内验证卡片等于放弃这次验证：成员此时被禁言，无法在群里求助，超时后会被移出，可重新进群重新验证。
+- 后台维护受 20 秒长轮询影响：超时结束、批准重试和清理通常在到期后数秒内完成。

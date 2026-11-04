@@ -43,10 +43,9 @@ def config(path='.env'):
 
 class Bot:
     def __init__(self, cfg, api=None, db=None):
-        self.cfg = dict(cfg)
-        if not self.cfg.get('CHANNEL_ID'):
+        if not cfg.get('CHANNEL_ID'):
             raise RuntimeError('CHANNEL_ID is required (verification channel id)')
-        if api is None and not self.cfg.get('TELEGRAM_BOT_TOKEN'):
+        if api is None and not cfg.get('TELEGRAM_BOT_TOKEN'):
             raise RuntimeError('TELEGRAM_BOT_TOKEN is required')
         self.api = api or API(cfg['TELEGRAM_BOT_TOKEN'])
         self.group = int(cfg.get('GROUP_ID') or DEFAULT_GROUP)
@@ -216,7 +215,7 @@ class Bot:
 
     def accepts_update(self, update):
         payload = (update.get('message') or update.get('chat_member') or
-                   update.get('chat_join_request') or update.get('edited_message'))
+                   update.get('chat_join_request'))
         if payload:
             chat = payload.get('chat') or {}
             return chat.get('type') == 'private' or chat.get('id') == self.group
@@ -266,13 +265,18 @@ class Bot:
             self.verification.forget(uid)
 
     def private_message(self, message):
+        uid = message['chat']['id']
+        if self.foreign_command(message):
+            # 指向其他机器人的命令不属于本机器人，保持静默。
+            return
         name = self.command_name(message)
         if name == '/start':
-            self.send(message['chat']['id'], self.start_text())
+            self.send(uid, self.start_text())
         elif name == '/help':
-            self.send(message['chat']['id'], self.help_text())
-        else:
-            self.send(message['chat']['id'], '这里只处理机器人支持的私聊功能，发送 /help 查看可用功能。')
+            self.send(uid, self.help_text())
+        elif name:
+            # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
+            self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
 
     def group_message(self, message):
         chat_id = message['chat']['id']
@@ -300,6 +304,14 @@ class Bot:
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。',
                       _delete_after=self.notice_seconds())
+
+    def foreign_command(self, message):
+        """``/cmd@其他机器人`` 不是发给本机器人的命令。"""
+        text = (message.get('text') or '').strip()
+        if not text.startswith('/'):
+            return False
+        name = text.split()[0].split('@', 1)
+        return len(name) > 1 and bool(self.username) and name[1].lower() != self.username.lower()
 
     def command_name(self, message):
         text = (message.get('text') or '').strip()

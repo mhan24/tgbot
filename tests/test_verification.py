@@ -166,7 +166,63 @@ class VerificationTests(unittest.TestCase):
         self.assertIsNone(self.row())
         self.assertIn('重新申请', self.alerts()[-1])
         self.assertTrue(self.bot.db.execute(
-            "SELECT 1 FROM audit WHERE action='verification_approve_failed'").fetchone())
+            "SELECT 1 FROM audit WHERE action='verification_approve_expired'").fetchone())
+
+    def test_transient_approval_failure_is_retried_in_the_background(self):
+        row = self.request()
+        original = self.api.call
+
+        def flaky(method, **data):
+            if method == 'approveChatJoinRequest':
+                raise APIError(method, {'error_code': 500, 'description': 'boom'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=flaky):
+            self.click(row)
+        stored = self.row()
+        self.assertEqual((stored['state'], stored['approved'], stored['approve_attempts']),
+                         ('passed', 0, 1))
+        self.assertIn('正在为你提交入群申请', self.alerts()[-1])
+        # 申请仍在 Telegram 侧挂起，后台继续重试而不是直接放弃。
+        with patch('bot.time.time', return_value=stored['retry_at']):
+            self.bot.verification.tick()
+        self.assertEqual(self.row()['approved'], 1)
+        self.assertEqual(self.row()['kind'], 'request')
+
+    def test_giving_up_on_approval_is_audited_and_keeps_the_record(self):
+        row = self.request()
+        original = self.api.call
+
+        def flaky(method, **data):
+            if method == 'approveChatJoinRequest':
+                raise APIError(method, {'error_code': 500, 'description': 'boom'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=flaky):
+            self.click(row)
+            for _ in range(6):
+                with patch('bot.time.time', return_value=self.row()['retry_at']):
+                    self.bot.verification.tick()
+        self.assertIsNotNone(self.row())
+        self.assertEqual(self.row()['approve_attempts'], 5)
+        self.assertTrue(self.bot.db.execute(
+            "SELECT 1 FROM audit WHERE action='verification_approve_gaveup'").fetchone())
+
+    def test_mute_failure_rejects_the_member_instead_of_leaving_them_open(self):
+        original = self.api.call
+
+        def cannot_restrict(method, **data):
+            if method == 'restrictChatMember':
+                raise APIError(method, {'error_code': 403, 'description': 'not enough rights'})
+            return original(method, **data)
+
+        with patch.object(self.api, 'call', side_effect=cannot_restrict):
+            self.join(2)
+        self.assertEqual([data['user_id'] for method, data in self.api.calls
+                          if method == 'unbanChatMember'], [2])
+        self.assertIsNone(self.row())
+        self.assertTrue(self.bot.db.execute(
+            "SELECT 1 FROM audit WHERE action='verification_restrict_failed'").fetchone())
 
     # --- 直接入群路径 -----------------------------------------------------
 
@@ -414,6 +470,14 @@ class VerificationTests(unittest.TestCase):
         with patch('bot.time.time', return_value=int(time.time()) + 3600):
             self.bot.sweep_deletions()
         self.assertEqual(self.bot.db.execute('SELECT count(*) FROM deletions').fetchone()[0], 0)
+
+    def test_duration_text_never_rounds_down(self):
+        self.bot.verify_seconds = 90
+        self.assertEqual(self.bot.verification.limit_text(), '1 分 30 秒')
+        self.bot.verify_seconds = 240
+        self.assertEqual(self.bot.verification.limit_text(), '4 分钟')
+        self.bot.verify_seconds = 45
+        self.assertEqual(self.bot.verification.limit_text(), '45 秒')
 
     def test_private_application_card_has_one_channel_button_and_four_answers(self):
         self.request()
