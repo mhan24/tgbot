@@ -1,58 +1,39 @@
 # 配置、部署与维护
 
-核对日期：2026-11-04。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。
+核对日期：2026-11-04。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。当前版本只包含入群验证功能。
 
-## 1. 运行条件与凭据
+## 1. 运行条件
 
-Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并能连接 Telegram、Jev、BIN 和汇率来源。
+Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并能连接 Telegram API。
 
-复制 `.env.example` 为 `.env` 并设置权限 `600`。环境变量优先于文件配置。不要在 Git、日志或文档中保存真实 token、API key、SSH 密码。
-
-| 环境变量 | 用途/默认值 |
+| 环境变量 | 用途 / 默认值 |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | 必填，机器人 token |
-| `GROUP_ID` / `CHANNEL_ID` | 默认群和验证频道的数字 ID |
-| `TELEGRAM_GROUP` / `TELEGRAM_CHANNEL` | 部署相关名称配置，不能替代数字 ID |
-| `DB_PATH` | 默认 `bot.sqlite3`；systemd 覆盖为 `/var/lib/tgbot/bot.sqlite3` |
-| `JEV_API_KEY` | 手动举报所用 Jev 凭据 |
-| `JEV_MODEL` / `JEV_ENABLED` | 默认 `jev-latest` / `1` |
-| `MESSAGE_POINTS` / `MESSAGE_DAILY_LIMIT` | 默认 `1` / `5` |
-| `MUTE_SECONDS` / `VERIFY_SECONDS` | 默认 `86400` / `240` 秒 |
-| `DELETE_AFTER_SECONDS` | 默认 `30` 秒；`0` 关闭自动清理 |
-| `UPGRADE_POINTS` / `UPGRADE_TAG` | 默认 `50` / `家人` |
+| `GROUP_ID` | 必填，默认群数字 ID；缺省时回退 `-1003014905211` |
+| `CHANNEL_ID` | 必填，验证频道数字 ID |
+| `TELEGRAM_CHANNEL` / `TELEGRAM_CHANNEL_URL` | “关注频道”按钮链接，可填 `@频道用户名` 或 t.me 链接；留空则卡片不显示该按钮 |
+| `TELEGRAM_GROUP` | 仅用于 `/start` 文案里的群名说明 |
+| `VERIFY_SECONDS` | 验证有效期，30–300 秒，默认 240；超出范围自动收敛 |
+| `DELETE_AFTER_SECONDS` | 群内机器人消息自动清理，0–3600 秒，默认 30；0 为关闭 |
+| `DB_PATH` | SQLite 路径，默认 `bot.sqlite3`；systemd 覆盖为 `/var/lib/tgbot/bot.sqlite3` |
 | `SSH_HOST` / `SSH_PORT` / `SSH_USER` / `SSH_PASSWORD` | 可选本地部署连接信息，机器人运行不使用；不要复制到服务器运行配置 |
 
-历史部署 `.env` 中遗留的 `AI_*`、`SUBQ_*`、`HISTORY_MESSAGES`、`HISTORY_CONTEXT` 键不再读取，可择机清理；不清理也不影响运行。
+复制 `.env.example` 为 `.env` 并设置权限 `600`（服务专用用户读取时为 `640` 且属组为服务组）。环境变量优先于文件配置。不要在 Git、日志或文档中保存真实 token 与密码。
 
-每日群内机器人操作次数限制已移除，无对应运行参数。
+旧版 `.env` 中的 `JEV_*`、`MESSAGE_POINTS`、`MESSAGE_DAILY_LIMIT`、`UPGRADE_*`、`MUTE_SECONDS` 已不再读取，可择机清理，不清理也不影响运行。
 
-## 2. 群权限与登记
+## 2. 群与频道权限
 
-机器人应为每个管理群和关联频道的管理员。群内需要删消息、限制成员及入群申请相关权限；设置成员标签还需 `can_manage_tags`。将目标群配置为需要审批的邀请途径。
+机器人必须是默认群和验证频道的管理员：
 
-默认群为 `@setupode`（`-1003014905211`），无需群登记或启用操作。机器人须具备该群及验证频道的管理员权限。
+- 频道：能读取成员状态（`getChatMember`）。
+- 群：删除消息、限制成员、邀请成员（`can_delete_messages`、`can_restrict_members`、`can_invite_users`）。群主身份无需这些权限。
 
-没有处理位置的首次启动会跳过积压更新；启动检测到已有 webhook 时拒绝替换，应先由维护人员确认该 token 的使用方式。不要启动两个同时轮询该 token 的实例。
+建议在群里开启“入群申请”，让验证在私聊完成；否则成员直接进群，由机器人先禁言再在群内验证。启动时会校验以上权限，缺少权限将直接退出并报错。
 
-## 3. 群主按钮配置
+没有处理位置的首次启动会跳过积压更新。启动检测到已有 webhook 时拒绝替换，应先确认该 token 的使用方式。不要启动两个同时轮询该 token 的实例。
 
-群主私聊 `/settings`，选项，再按普通消息提示直接发新值。无需引用回复，也不用弹窗。待输入有效期 10 分钟，`/cancel` 取消；开关直接按钮切换，覆盖值可恢复默认。
-
-| 配置项 | 合法范围 |
-|---|---|
-| 每条发言积分 | 1–100 |
-| 每日发言积分上限 | 0–1000 |
-| 默认临时禁言 | 60–2592000 秒 |
-| 入群验证时长 | 30–300 秒 |
-| 群内自动删除 | 0–3600 秒，0 关闭 |
-| Jev 举报 | 开/关 |
-| 达标积分门槛 | 1–1000000 |
-| 成员标签 | 最多 16 个 UTF-16 单位，不允许 Emoji |
-| 验证频道、频道邀请链接 | 本群频道用户名/数字 ID；对应 Telegram 链接 |
-
-群主不能在设置中修改机器人 token、API key 或数据库路径。十连签到的逐抽计分（0/1/5/10）、单次 3 个四/五星上限、50/50 与大保底、四星/五星保底规则固定，不提供群主修改。群配置持久保存、立即生效并覆盖部署默认值；改 `.env` 默认值需要重启，不会覆盖本群已保存的自定义值。生产库中遗留的 AI/HISTORY 配置行不再读取，也不会出现在 `/settings`，无需手工删除。
-
-## 4. systemd 部署示例
+## 3. systemd 部署
 
 以下由主机管理员执行。先把代码放到 `/opt/tgbot`，并填写该目录的 `.env`。
 
@@ -68,52 +49,42 @@ systemctl enable --now tgbot
 systemctl status tgbot --no-pager
 ```
 
-源码目录需对 `tgbot` 可读。配置归属与 `640` 示例用于让专用服务用户读取；本地只供当前用户读取时使用 `600`。服务使用 `UMask=0077`、只读系统目录和专用 StateDirectory，数据库不能放在被只读保护的源码目录。
+源码目录需对 `tgbot` 可读。服务使用 `UMask=0077`、只读系统目录和专用 StateDirectory，数据库不能放在被只读保护的源码目录。
 
-## 5. 验证与更新
+## 4. 验证与更新
 
 ```sh
 cd /opt/tgbot
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -q
 systemctl restart tgbot
 systemctl is-active tgbot
 journalctl -u tgbot -n 50 --no-pager
-python3 scripts/update_commands.py
 ```
 
-菜单脚本使用 `/opt/tgbot/.env` 与 `/var/lib/tgbot/bot.sqlite3`，需要相应读权限。它核对默认、群、管理员、成员及语言菜单，清理不在命令表的条目并维护当前命令说明；空菜单继续继承 Telegram 的默认菜单。不会发群通知，也不是从零初始化命令菜单的工具。
+启动日志应包含 `Started @用户名 group=群ID`。功能验证建议用自己的测试账号申请入群，确认：私聊收到卡片、未关注时提示先关注、答对后自动批准、答错 3 次或超时被拒绝、验证卡片在结束后按 30 秒清理。
 
-更新前备份源码和所有业务数据库；只上传源文件、文档、模板与测试，不覆盖 `.env` 或数据库。更新后核对默认群权限、30 秒设置、权限及后台错误。使用模拟 API 测试，不用真实群员做处罚试验。确认服务能启动不等于所有外部 API 永久可用。
+菜单文案变化后运行 `python3 scripts/update_commands.py`（只更新已有菜单，不发送群消息），再用 Telegram 客户端确认命令菜单只剩 `/start`、`/help`。
 
-## 6. 备份与恢复
+## 5. 备份与恢复
 
-默认群数据库为 `/var/lib/tgbot/bot.sqlite3`。使用 Python `sqlite3.Connection.backup()` 可生成一致性快照；备份目录仅维护人员可读。配置和凭据另外安全备份，不能上传公开仓库。
+```sh
+systemctl stop tgbot
+cp -a /var/lib/tgbot/bot.sqlite3* /备份路径/
+systemctl start tgbot
+```
 
-恢复时先停服，恢复匹配版本的源码、全部数据库和配置，确认数据库归属 `tgbot:tgbot`，再启动。恢复旧数据库会恢复旧处理位置和任务，可能重新处理恢复点之后的更新；检查审计与事件去重。重新开始的实例不要同时连接同一 token。
+或使用 SQLite backup API 在线备份。`.env` 与数据库分开存放；备份文件不提交到 Git。
 
-## 7. 排查
+## 6. 排查
 
-| 现象 | 先检查 |
+| 现象 | 排查方向 |
 |---|---|
-| 所有群无响应 | 服务状态、token、网络、webhook 冲突和是否存在第二个轮询实例 |
-| 消息未删除 | 本群删除设置、是否仍待验证/审批/投票、删除权限和错误记录 |
-| 管理按钮无效 | 所属群是否启用、面板是否超过 5 分钟、操作者是否为打开它的当前管理员 |
-| 用户名无法解析 | 用户是否已收录、用户名是否变更；回复用户消息或使用数字 ID |
-| 未加积分 | 每日额度、头像可见性、验证状态、消息类型及是否重复更新 |
-| Jev 未处罚 | 必须手动 `/report`、是否达到确认条件、发送者是否豁免、接口是否失败 |
+| 启动报 `Bot must be administrator in channel` | 机器人未加入频道或不是频道管理员 |
+| 启动报 `Missing administrator right ...` | 群内管理员权限缺少删除消息、限制成员或邀请成员 |
+| 申请后收不到验证卡片 | 用户与机器人私聊被拦截（`Forbidden: bot can't initiate conversation`）；此时申请会被拒绝并记录审计，用户需先私聊机器人发 `/start` |
+| 直接进群的成员无法发言 | 正在等待验证；答对后自动恢复，超时会被移出 |
+| 验证卡片没有清理 | `DELETE_AFTER_SECONDS=0` 关闭了清理；恢复为非 0 后重启 |
+| 日志出现 `Verification conclusion deferred` | 机器人缺少限制/邀请权限或 Telegram 暂时失败；记录保留并每 30 秒重试 |
+| 日志出现 `Restore permissions failed` | 恢复发言失败，后台最多重试 5 次；仍未成功时在 Telegram 手动解除限制 |
 
-## 当前数据库结构与清理策略
-
-当前版本直接创建完整表结构，不提供旧版本补字段、旧表单转换或已下线功能的启动迁移。仅支持本次部署确认过的当前结构及新建空库；不要把不匹配的旧库直接覆盖到生产。
-
-启动时会校验本群 `group_settings`：键属于已下线功能或值无法按当前规则解析的行会被删除并记录 `Removed obsolete group settings` 日志，随后按默认值运行；这是唯一自动执行的配置清理，其他旧表与旧数据仍需授权后人工处理。
-
-本次仅清理旧功能残留表、旧表单版本字段与兼容代码。积分余额、账本、每日额度、邀请防重复记录及现用处罚、配置和会话保留。关键词积分、限时夺宝和 AI 问答的表（`keyword_*`、`treasure*`、`ai_*`、`ai_media`、`chat_history`）不再创建和使用；旧库中的这些表成为无引用的历史数据，代码不会读取或删除，可在授权维护时人工清理。上线前对现用业务表逐项比对，清理操作由本次维护执行，不在机器人每次启动时重复做。SQLite 快照与匹配源码保留为维护备份，恢复须核对结构，不能依赖旧迁移代码。
-
-### 头像检查诊断日志
-
-每次头像接口检查均记录 `Avatar check` 元数据：时间（日志时间戳）、群 ID、用户 ID、用途 `checkin/message/diagnostic`、关联消息 ID、接口 `total_count`、返回头像组数、可见/不可见/未知结论、原因、API 错误码，以及二次资料头像核验的 chat_photo/chat_status。检查日志与警告审计分开，按群/用户/消息 ID 和时间关联；`/audit` 不展示全部头像检查。通过 `journalctl -u tgbot` 查询，保留期限取决于服务器 journald 配置。不会记录头像图片、file_id、完整接口响应、API 错误描述或凭据。头像列表为空时额外查询该成员的私聊资料头像；任一接口明确返回头像即通过。二次核验超时、报错、身份不符或响应异常按未知处理，不加分、不警告；两项查询均无头像才判不可见。已有历史警告无法补回当时的响应。
-
-### 签到十连当前结构
-
-`checkin_pity` 按用户保存四星/五星保底计数、下次五星大保底标记，跨天累计；`checkin_draws` 以签到事件为主键保存十连结果、本次总积分及结果/播报发送标记。`points.py` 启动时创建完整现用表结构；现用库重复启动安全，不再自动升级缺少 `guaranteed` 的旧表。部署前已有的签到积分和每日签到事件保留；新规则从部署后的下一次签到开始生效，不补抽历史签到。旧库中的 `CHECKIN_MIN`/`CHECKIN_MAX` 设置行不再读取，也不会出现在 `/settings`，无需手工删除。
+日志只记录动作、标识和错误码，不记录 token、完整请求头或消息原文。

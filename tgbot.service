@@ -1,5 +1,5 @@
 [Unit]
-Description=Setup Telegram Group Moderation Bot
+Description=Setup Telegram Group Verification Bot
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
