@@ -56,13 +56,13 @@ class CoreTests(unittest.TestCase):
         self.bot.username = 'testbot'
         self.addCleanup(self.bot.db.close)
 
+    def deleted(self):
+        return [data for method, data in self.api.calls if method == 'deleteMessage']
+
     def message(self, mid, text, chat=-1, uid=2, chat_type='supergroup'):
         return {'update_id': mid, 'message': {
             'chat': {'id': chat, 'type': chat_type}, 'message_id': mid,
             'from': {'id': uid, 'first_name': 'U'}, 'text': text}}
-
-    def queued(self):
-        return {row['message_id']: row['due'] for row in self.bot.db.execute('SELECT * FROM deletions')}
 
     def test_other_groups_and_unrelated_updates_are_ignored(self):
         for update in ({'message': {'chat': {'id': -3, 'type': 'supergroup'}, 'from': {'id': 2},
@@ -107,11 +107,10 @@ class CoreTests(unittest.TestCase):
         self.bot.handle(self.message(3, '/help@otherbot', chat=2, chat_type='private'))
         self.assertEqual(len(self.api.calls), before)
 
-    def test_unknown_group_command_points_to_help_with_failure_lifetime(self):
-        with patch('bot.time.time', return_value=1000):
-            self.bot.handle(self.message(1, '/checkin'))
+    def test_unknown_group_command_points_to_help(self):
+        self.bot.handle(self.message(1, '/checkin'))
         self.assertIn('/help', self.api.texts()[-1])
-        self.assertEqual(self.queued()[self.api.sent], 1000 + 120)
+        self.assertEqual(self.deleted(), [])
 
     def test_rate_and_bin_commands_are_dispatched_with_arguments(self):
         with patch.object(self.bot.exchange, 'convert', return_value='RATE_TEXT') as convert, \
@@ -125,22 +124,53 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(query.call_args_list[0][0][0], ['45717360'])
             self.assertIn('RATE_TEXT', self.api.texts())
             self.assertIn('BIN_TEXT', self.api.texts())
-            # 群内成功回复进入普通清理队列；私聊成功回复不排队。
-            self.assertTrue(self.queued())
-            before = len(self.queued())
+            # 群内与私聊的成功回复都留在聊天里。
             self.bot.handle(self.message(4, '/rate USD CNY', chat=5, chat_type='private'))
-            self.assertEqual(len(self.queued()), before)
+            self.assertEqual(self.api.texts().count('RATE_TEXT'), 2)
+            self.assertEqual(self.deleted(), [])
 
-    def test_rate_and_bin_failures_use_notice_lifetime_in_group(self):
-        with patch('bot.time.time', return_value=1000), \
-                patch.object(self.bot.exchange, 'convert',
-                             side_effect=RateError('汇率服务暂时不可用，请稍后重试。')), \
+    def test_rate_and_bin_failures_are_reported_and_kept(self):
+        with patch.object(self.bot.exchange, 'convert',
+                          side_effect=RateError('汇率服务暂时不可用，请稍后重试。')), \
                 patch.object(self.bot.bin_lookup, 'query',
                              side_effect=BinError('用法：/bin 45717360（6–8 位数字）。')):
             self.bot.handle(self.message(1, '/rate USD CNY'))
             self.bot.handle(self.message(2, '/bin x'))
-        self.assertEqual(self.queued()[self.api.sent - 1], 1120)
-        self.assertEqual(self.queued()[self.api.sent], 1120)
+        self.assertIn('汇率服务暂时不可用，请稍后重试。', self.api.texts())
+        self.assertIn('用法：/bin 45717360（6–8 位数字）。', self.api.texts())
+        self.assertEqual(self.deleted(), [])
+
+    def test_quick_poll_runs_only_while_verification_needs_work(self):
+        self.assertFalse(self.bot.pending_verification())
+
+        def store(**values):
+            row = dict(uid=7, chat=-1, kind='request', nonce='n', question='2 + 2', answer=4,
+                       options='[]', expires=int(time.time()) + 60, attempts=0,
+                       state='passed', sent=1, send_attempts=1, restored=0,
+                       restore_attempts=0, approved=1, approve_attempts=0,
+                       finish_attempts=0, retry_at=0, updated=0)
+            row.update(values)
+            with self.bot.db:
+                self.bot.db.execute(
+                    'INSERT OR REPLACE INTO verification(uid,chat,kind,nonce,question,answer,'
+                    'options,expires,attempts,state,sent,send_attempts,restored,restore_attempts,'
+                    'approved,approve_attempts,finish_attempts,retry_at,updated) '
+                    'VALUES(:uid,:chat,:kind,:nonce,:question,:answer,:options,:expires,:attempts,'
+                    ':state,:sent,:send_attempts,:restored,:restore_attempts,:approved,'
+                    ':approve_attempts,:finish_attempts,:retry_at,:updated)', row)
+
+        store()  # 已批准、已恢复的通过记录不占用快速轮询
+        self.assertFalse(self.bot.pending_verification())
+        store(state='challenge')
+        self.assertTrue(self.bot.pending_verification())
+        store(kind='member', state='passed', restored=0)
+        self.assertTrue(self.bot.pending_verification())
+        store(kind='member', state='passed', restored=1)
+        self.assertFalse(self.bot.pending_verification())
+        store(kind='request', state='passed', approved=0)
+        self.assertTrue(self.bot.pending_verification())
+        store(kind='request', state='passed', approved=1)
+        self.assertFalse(self.bot.pending_verification())
 
     def test_rate_and_bin_still_require_pending_verification_in_group(self):
         with patch.object(self.bot.exchange, 'convert', return_value='RATE_TEXT') as convert:
@@ -150,29 +180,13 @@ class CoreTests(unittest.TestCase):
         convert.assert_not_called()
         self.assertEqual(self.api.calls, [])
 
-    def test_group_default_retention_and_explicit_overrides(self):
-        with patch('bot.time.time', return_value=100):
-            default = self.bot.send(self.bot.group, '普通提示')
-            failure = self.bot.send(self.bot.group, '失败提示', _delete_after=self.bot.notice_seconds())
-            kept = self.bot.send(self.bot.group, '交互卡片', keep=True)
-            custom = self.bot.send(self.bot.group, '自定义时长', _delete_after=600)
-        queued = self.queued()
-        self.assertEqual(queued[default['message_id']], 130)
-        self.assertEqual(queued[failure['message_id']], 100 + self.bot.notice_seconds())
-        self.assertNotIn(kept['message_id'], queued)
-        self.assertEqual(queued[custom['message_id']], 700)
+    def test_group_and_private_replies_are_never_deleted(self):
+        for chat, chat_type in ((self.bot.group, 'supergroup'), (2, 'private')):
+            self.bot.handle(self.message(1, '/help', chat=chat, chat_type=chat_type))
+            self.bot.send(chat, '普通提示')
+        self.assertEqual(self.deleted(), [])
 
-    def test_private_messages_are_not_auto_deleted(self):
-        self.bot.send(2, '私聊提示')
-        self.assertEqual(self.queued(), {})
-
-    def test_retention_can_be_disabled(self):
-        self.bot.delete_after = 0
-        self.assertEqual(self.bot.notice_seconds(), 0)
-        self.bot.send(self.bot.group, '提示')
-        self.assertEqual(self.queued(), {})
-
-    def test_other_bot_messages_are_queued_but_own_and_channel_posts_are_not(self):
+    def test_other_bot_and_channel_posts_are_left_alone(self):
         self.bot.handle({'update_id': 1, 'message': {
             'chat': {'id': -1, 'type': 'supergroup'}, 'message_id': 11,
             'from': {'id': 500, 'is_bot': True}, 'text': '别的机器人'}})
@@ -182,58 +196,14 @@ class CoreTests(unittest.TestCase):
         self.bot.handle({'update_id': 3, 'message': {
             'chat': {'id': -1, 'type': 'supergroup'}, 'message_id': 13,
             'sender_chat': {'id': -55, 'type': 'channel'}, 'from': {'id': 777000}, 'text': '频道帖'}})
-        self.assertEqual(list(self.queued()), [11])
-
-    def test_due_messages_are_deleted_and_future_ones_kept(self):
-        self.bot.send(self.bot.group, 'first')
-        self.bot.schedule_delete(self.bot.group, 99)
-        with self.bot.db:
-            self.bot.db.execute('UPDATE deletions SET due=0 WHERE message_id=1')
-            self.bot.db.execute('UPDATE deletions SET due=? WHERE message_id=99',
-                                (int(time.time()) + 3600,))
-        self.bot.sweep_deletions()
-        deleted = [data['message_id'] for method, data in self.api.calls if method == 'deleteMessage']
-        self.assertEqual(deleted, [1])
-        self.assertEqual([row['message_id'] for row in
-                          self.bot.db.execute('SELECT message_id FROM deletions')], [99])
-
-    def test_permanent_delete_failure_is_dropped(self):
-        self.bot.schedule_delete(self.bot.group, 7)
-        with self.bot.db:
-            self.bot.db.execute('UPDATE deletions SET due=0')
-
-        def gone(method, **data):
-            raise APIError(method, {'error_code': 400, 'description': 'message to delete not found'})
-
-        with patch.object(self.api, 'call', side_effect=gone):
-            self.bot.sweep_deletions()
-        self.assertEqual(self.queued(), {})
-
-    def test_transient_delete_failure_is_retried_then_dropped(self):
-        self.bot.schedule_delete(self.bot.group, 7)
-        self.api.failure = 'deleteMessage'
-        for _ in range(3):
-            with self.bot.db:
-                self.bot.db.execute('UPDATE deletions SET due=0')
-            self.bot.sweep_deletions()
-        self.assertEqual(self.queued(), {})
-        self.assertTrue(self.bot.db.execute(
-            "SELECT 1 FROM audit WHERE action='delete_giveup'").fetchone())
-
-    def test_deletion_queue_survives_restart(self):
-        self.bot.send(self.bot.group, 'hello')
-        due = self.queued()[1]
-        restarted = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api, self.bot.db)
-        restarted.sweep_deletions()
-        self.assertEqual([row['due'] for row in
-                          self.bot.db.execute('SELECT due FROM deletions')], [due])
+        self.bot.maintenance()
+        self.assertEqual(self.deleted(), [])
 
     def test_schema_holds_only_current_tables(self):
         tables = {row[0] for row in self.bot.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'meta', 'processed', 'audit', 'deletions',
-                                   'verification', 'verification_prompts',
-                                   'rates', 'bin_cache'})
+        self.assertEqual(tables, {'meta', 'processed', 'audit',
+                                   'verification', 'rates', 'bin_cache'})
         self.assertFalse(tables & {'point_users', 'point_events', 'checkin_pity', 'checkin_draws',
                                    'mutes', 'upgrades', 'private_steps', 'known_bots',
                                    'user_activity'})
@@ -298,14 +268,19 @@ class CoreTests(unittest.TestCase):
             seen.append('tick')
 
         with patch.object(self.bot.verification, 'tick', side_effect=failure), \
-                patch.object(self.bot, 'sweep_deletions', side_effect=tick), \
+                patch.object(self.bot, 'prune_processed', side_effect=tick), \
                 patch('bot.time.time', return_value=100):
             self.bot.maintenance()
+            self.assertEqual(seen, ['failed', 'tick'])
+            # 冷却期内两项任务都不再执行。
             self.bot.maintenance()
-            self.assertEqual(seen, ['failed', 'tick', 'tick'])
+            self.assertEqual(seen, ['failed', 'tick'])
             with patch('bot.time.time', return_value=131):
                 self.bot.maintenance()
-            self.assertEqual(seen.count('failed'), 2)
+            self.assertEqual(seen, ['failed', 'tick', 'failed'])
+            with patch('bot.time.time', return_value=701):
+                self.bot.maintenance()
+            self.assertEqual(seen.count('tick'), 2)
 
 
 class TransportTests(unittest.TestCase):

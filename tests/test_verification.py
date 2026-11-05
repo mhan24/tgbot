@@ -1,5 +1,5 @@
 # coding: utf-8
-"""入群验证测试：频道校验、算术题、超时/答错拒绝、失败恢复与卡片清理。"""
+"""入群验证测试：频道校验、算术题、超时/答错拒绝、失败恢复与卡片保留。"""
 import sqlite3
 import time
 import unittest
@@ -10,7 +10,7 @@ from botapi import APIError
 from test_bot import FakeAPI
 
 CFG = {'GROUP_ID': '-1', 'CHANNEL_ID': '-2', 'VERIFY_SECONDS': '240',
-       'DELETE_AFTER_SECONDS': '30', 'TELEGRAM_CHANNEL': '@setup0de'}
+       'TELEGRAM_CHANNEL': '@setup0de'}
 
 
 class VerificationTests(unittest.TestCase):
@@ -439,37 +439,32 @@ class VerificationTests(unittest.TestCase):
         self.assertTrue(self.bot.db.execute(
             "SELECT 1 FROM audit WHERE action='verification_restore_gaveup'").fetchone())
 
-    # --- 卡片清理 ---------------------------------------------------------
+    # --- 卡片保留 ---------------------------------------------------------
 
-    def test_group_card_is_cleaned_after_verification_ends(self):
+    def test_answered_group_card_is_edited_and_kept(self):
         self.join(2)
-        self.assertEqual(self.bot.db.execute(
-            'SELECT count(*) FROM verification_prompts').fetchone()[0], 1)
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM deletions').fetchone()[0], 0)
         with patch('bot.time.time', return_value=2000):
             self.click(self.row())
-            self.bot.sweep_deletions()
-        queued = self.bot.db.execute('SELECT * FROM deletions').fetchone()
-        self.assertEqual((queued['message_id'], queued['due']), (1, 2030))
-        with patch('bot.time.time', return_value=2030):
-            self.bot.sweep_deletions()
-        self.assertIn(('deleteMessage', {'chat_id': -1, 'message_id': 1}), self.api.calls)
+        self.assertNotIn('deleteMessage', self.methods())
+        edited = [data['text'] for method, data in self.api.calls if method == 'editMessageText'][-1]
+        self.assertIn('已通过频道关注与人机验证', edited)
 
-    def test_expired_card_is_cleaned_after_restart(self):
+    def test_expired_card_stays_in_chat_after_timeout(self):
         self.join(2)
         expires = self.row()['expires']
         restarted = Bot(dict(CFG), self.api, self.bot.db)
         with patch('bot.time.time', return_value=expires + 1):
-            restarted.sweep_deletions()
-        queued = self.bot.db.execute('SELECT due FROM deletions WHERE message_id=1').fetchone()
-        self.assertEqual(queued[0], expires + 1 + 30)
+            restarted.verification.tick()
+        self.assertIn('unbanChatMember', self.methods())
+        self.assertNotIn('deleteMessage', self.methods())
+        self.assertIsNone(self.row())
 
-    def test_disabled_cleanup_keeps_cards(self):
+    def test_verification_no_longer_tracks_messages_for_deletion(self):
         self.join(2)
-        self.bot.delete_after = 0
-        with patch('bot.time.time', return_value=int(time.time()) + 3600):
-            self.bot.sweep_deletions()
-        self.assertEqual(self.bot.db.execute('SELECT count(*) FROM deletions').fetchone()[0], 0)
+        tables = {row[0] for row in self.bot.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn('verification_prompts', tables)
+        self.assertNotIn('deletions', tables)
 
     def test_duration_text_never_rounds_down(self):
         self.bot.verify_seconds = 90

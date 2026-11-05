@@ -1,54 +1,73 @@
 # coding: utf-8
-"""消息保留时长：群默认时长、显式类别时长和关闭清理时的行为。"""
+"""消息保留：机器人不自动删除任何消息，也没有删除队列与清理时长配置。"""
 import sqlite3
+import time
 import unittest
 from unittest.mock import patch
 
 from bot import Bot
-from retention import NOTICE_SECONDS
 from test_bot import FakeAPI
 
 
 class RetentionTests(unittest.TestCase):
     def setUp(self):
         self.api = FakeAPI()
-        self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2', 'DELETE_AFTER_SECONDS': '45'},
-                       self.api, sqlite3.connect(':memory:'))
+        self.bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2'}, self.api,
+                       sqlite3.connect(':memory:'))
+        self.bot.bot_id = 99
+        self.bot.username = 'testbot'
         self.addCleanup(self.bot.db.close)
 
-    def due(self):
-        return {row['message_id']: row['due']
-                for row in self.bot.db.execute('SELECT * FROM deletions')}
+    def deleted(self):
+        return [data for method, data in self.api.calls if method == 'deleteMessage']
 
-    def test_group_default_follows_configuration(self):
-        with patch('bot.time.time', return_value=100):
-            sent = self.bot.send(self.bot.group, '普通成功提示')
-        self.assertEqual(self.due()[sent['message_id']], 145)
+    def tables(self):
+        return {row[0] for row in self.bot.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
 
-    def test_wording_never_changes_the_lifetime(self):
-        # 不按文案关键词猜类别：同一句话在成功与失败路径上由调用方声明时长。
-        with patch('bot.time.time', return_value=100):
-            default = self.bot.send(self.bot.group, '暂时无法处理，请稍后重试。')
-            explicit = self.bot.send(self.bot.group, '同样的文案',
-                                     _delete_after=self.bot.notice_seconds())
-        due = self.due()
-        self.assertEqual(due[default['message_id']], 145)
-        self.assertEqual(due[explicit['message_id']], 100 + NOTICE_SECONDS)
+    def test_group_success_and_failure_notices_stay(self):
+        for text in ('普通提示', '尚未提供这个命令，发送 /help 查看可用功能。'):
+            self.bot.send(self.bot.group, text)
+        with patch('bot.time.time', return_value=time.time() + 30 * 86400):
+            self.bot.maintenance()
+        self.assertEqual(self.deleted(), [])
 
-    def test_explicit_duration_wins_over_keep(self):
-        with patch('bot.time.time', return_value=100):
-            sent = self.bot.send(self.bot.group, '交互卡片', keep=True, _delete_after=600)
-        self.assertEqual(self.due()[sent['message_id']], 700)
+    def test_group_and_private_replies_share_one_send_path(self):
+        self.bot.send(self.bot.group, '群内提示')
+        self.bot.send(2, '私聊提示')
+        chats = [data['chat_id'] for method, data in self.api.calls if method == 'sendMessage']
+        self.assertEqual(chats, [self.bot.group, 2])
+        self.assertEqual(self.deleted(), [])
 
-    def test_notice_duration_is_disabled_with_group_cleanup(self):
-        self.bot.delete_after = 0
-        self.assertEqual(self.bot.notice_seconds(), 0)
-        with patch('bot.time.time', return_value=100):
-            self.bot.send(self.bot.group, '失败提示', _delete_after=self.bot.notice_seconds())
-        self.assertEqual(self.due(), {})
+    def test_verification_card_is_sent_without_cleanup_booking(self):
+        self.bot.verification.admit({'id': 7, 'first_name': 'P'}, 'member', self.bot.group)
+        self.assertIn('sendMessage', self.api.methods())
+        with patch('bot.time.time', return_value=time.time() + 30 * 86400):
+            self.bot.maintenance()
+        self.assertEqual(self.deleted(), [])
 
-    def test_failure_notice_outlives_success_notice(self):
-        self.assertGreater(NOTICE_SECONDS, 30)
+    def test_cleanup_configuration_is_no_longer_read(self):
+        # DELETE_AFTER_SECONDS 已移除：旧配置既不让消息被删，也不会阻止发送。
+        bot = Bot({'GROUP_ID': '-1', 'CHANNEL_ID': '-2', 'DELETE_AFTER_SECONDS': '0'},
+                  FakeAPI(), sqlite3.connect(':memory:'))
+        self.addCleanup(bot.db.close)
+        self.assertFalse(hasattr(bot, 'delete_after'))
+        bot.send(bot.group, '提示')
+        self.assertNotIn('deletions', {row[0] for row in bot.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")})
+
+    def test_no_deletion_or_prompt_tables_are_created(self):
+        self.assertNotIn('deletions', self.tables())
+        self.assertNotIn('verification_prompts', self.tables())
+        self.assertFalse(hasattr(self.bot, 'schedule_delete'))
+        self.assertFalse(hasattr(self.bot, 'sweep_deletions'))
+
+    def test_only_punishment_revokes_member_messages(self):
+        # 唯一会动消息的仍是处罚：移出成员时按 Telegram 语义撤回其发言。
+        self.bot.call('banChatMember', chat_id=self.bot.group, user_id=5)
+        bans = [data for method, data in self.api.calls if method == 'banChatMember']
+        self.assertTrue(bans[0]['revoke_messages'])
+        self.assertEqual(self.deleted(), [])
 
 
 if __name__ == '__main__':

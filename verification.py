@@ -54,9 +54,6 @@ class Verification:
           finish_attempts INTEGER NOT NULL DEFAULT 0,
           retry_at INTEGER NOT NULL DEFAULT 0,
           updated INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS verification_prompts(
-          chat INTEGER, message_id INTEGER, uid INTEGER, nonce TEXT, expires INTEGER,
-          PRIMARY KEY(chat, message_id));
         ''')
         self.require_schema()
 
@@ -73,7 +70,7 @@ class Verification:
             raise RuntimeError(
                 'verification table has an incompatible schema; missing columns: '
                 + ', '.join(sorted(missing))
-                + '. Drop verification and verification_prompts, then restart.')
+                + '. Drop verification, then restart.')
 
     # --- 入口 -------------------------------------------------------------
 
@@ -252,8 +249,8 @@ class Verification:
     def _deliver(self, row):
         uid = row['uid']
         try:
-            sent = self.bot.send(row['chat'], self._card_text(row),
-                                 reply_markup=self._keyboard(row), keep=True)
+            # 卡片发出后一直保留在聊天里，结束时只编辑文案，不安排删除。
+            self.bot.send(row['chat'], self._card_text(row), reply_markup=self._keyboard(row))
         except APIError as exc:
             attempts = row['send_attempts'] + 1
             LOG.warning('Verification delivery failed uid=%s code=%s attempt=%s', uid, exc.code, attempts)
@@ -267,10 +264,6 @@ class Verification:
         with self.db:
             self.db.execute('UPDATE verification SET sent=1, send_attempts=send_attempts+1, retry_at=0 '
                             'WHERE uid=?', (uid,))
-            if row['chat'] == self.bot.group and isinstance(sent, dict) and sent.get('message_id'):
-                self.db.execute('INSERT OR REPLACE INTO verification_prompts(chat,message_id,uid,nonce,expires) '
-                                'VALUES(?,?,?,?,?)',
-                                (row['chat'], int(sent['message_id']), uid, row['nonce'], row['expires']))
 
     def _fail(self, row, reason):
         """结束一个未通过的验证：拒绝申请或移出成员；失败时标记过期并重试。"""
@@ -325,8 +318,7 @@ class Verification:
         try:
             self.bot.send(self.bot.group,
                           f'⚠️ 成员 <a href="tg://user?id={uid}">UID {uid}</a> 已通过验证，'
-                          '但机器人多次恢复发言失败，请在群设置中手动解除限制。',
-                          _delete_after=self.bot.notice_seconds())
+                          '但机器人多次恢复发言失败，请在群设置中手动解除限制。')
         except APIError as exc:
             LOG.warning('Admin notice failed uid=%s code=%s', uid, exc.code)
 

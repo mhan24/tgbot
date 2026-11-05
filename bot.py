@@ -12,7 +12,6 @@ import re
 import sqlite3
 import time
 
-from retention import NOTICE_SECONDS
 from binlookup import BinError, BinLookup
 from botapi import API, APIError
 from exchange import Exchange, RateError
@@ -56,8 +55,6 @@ class Bot:
         self.channel_url = self._configured_channel_url(cfg)
         self.verify_seconds = self._bounded(cfg.get('VERIFY_SECONDS'), DEFAULT_VERIFY_SECONDS,
                                             MIN_VERIFY_SECONDS, MAX_VERIFY_SECONDS)
-        # 群内机器人消息的自动清理时长；0 关闭自动清理。
-        self.delete_after = self._bounded(cfg.get('DELETE_AFTER_SECONDS'), 30, 0, 3600)
         self.db = db or sqlite3.connect(cfg.get('DB_PATH') or 'bot.sqlite3')
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
@@ -66,8 +63,6 @@ class Bot:
         CREATE TABLE IF NOT EXISTS processed(id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,
           target INTEGER,action TEXT,detail TEXT);
-        CREATE TABLE IF NOT EXISTS deletions(chat INTEGER,message_id INTEGER,
-          attempts INTEGER DEFAULT 0,due INTEGER,PRIMARY KEY(chat,message_id));
         ''')
         self.verification = Verification(self)
         self.exchange = Exchange(self.db)
@@ -96,12 +91,10 @@ class Bot:
     # --- Telegram 调用与消息生命周期 --------------------------------------
 
     def call(self, method, **kwargs):
-        keep = kwargs.pop('_keep', False)
-        delete_after = kwargs.pop('_delete_after', None)
         if method == 'banChatMember':
             kwargs['revoke_messages'] = True
         try:
-            result = self.api.call(method, **kwargs)
+            return self.api.call(method, **kwargs)
         except APIError as exc:
             if (method == 'answerCallbackQuery' and exc.permanent and
                     any(term in exc.description.lower()
@@ -109,76 +102,17 @@ class Bot:
                 LOG.info('Callback acknowledgement expired; business state retained')
                 return False
             raise
-        if method == 'sendMessage' and isinstance(result, dict):
-            if delete_after is not None or not keep:
-                self.schedule_delete(kwargs.get('chat_id'), result.get('message_id'), seconds=delete_after)
-        return result
 
-    def send(self, chat, text, keep=False, **kwargs):
-        return self.call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', _keep=keep, **kwargs)
+    def send(self, chat, text, **kwargs):
+        """唯一的发送入口；机器人发出的消息一律保留在聊天里。"""
+        return self.call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', **kwargs)
 
-    def notice_seconds(self):
-        """失败与处罚通知的显式保留时长；群清理关闭时跟随为 0。"""
-        return NOTICE_SECONDS if self.delete_after > 0 else 0
-
-    def schedule_delete(self, chat, message_id, seconds=None):
-        delay = self.delete_after if seconds is None else seconds
-        if delay <= 0 or chat is None or not message_id or chat != self.group:
-            return
-        with self.db:
-            self.db.execute('INSERT OR IGNORE INTO deletions(chat,message_id,attempts,due) VALUES(?,?,0,?)',
-                            (chat, int(message_id), int(time.time()) + delay))
-
-    def sweep_deletions(self):
-        self.queue_finished_cards()
-        rows = self.db.execute('SELECT * FROM deletions WHERE due<=? ORDER BY due LIMIT 50',
-                               (int(time.time()),)).fetchall()
-        for row in rows:
-            try:
-                self.call('deleteMessage', chat_id=row['chat'], message_id=row['message_id'])
-            except APIError as exc:
-                if exc.permanent:
-                    # 已删除或无权删除：不再重试。
-                    self.drop_deletion(row)
-                elif exc.code == 429:
-                    self.defer_deletion(row, exc.retry_after)
-                else:
-                    LOG.warning('Delete failed %s:%s code=%s', row['chat'], row['message_id'], exc.code)
-                    self.defer_deletion(row, 30)
-                continue
-            self.drop_deletion(row)
-
-    def drop_deletion(self, row):
-        with self.db:
-            self.db.execute('DELETE FROM deletions WHERE chat=? AND message_id=?',
-                            (row['chat'], row['message_id']))
-
-    def defer_deletion(self, row, delay):
-        if row['attempts'] + 1 >= 3:
-            # 无法删除的消息不再无限重试，只记录放弃原因。
-            self.drop_deletion(row)
-            self.audit(0, 0, 'delete_giveup', f'{row["chat"]}:{row["message_id"]}')
-            return
-        with self.db:
-            self.db.execute('UPDATE deletions SET attempts=attempts+1,due=? WHERE chat=? AND message_id=?',
-                            (int(time.time()) + delay, row['chat'], row['message_id']))
-
-    def queue_finished_cards(self):
-        """验证结束后把群内验证卡片转入普通清理队列；关闭清理时只移除记录。"""
-        rows = self.db.execute('''SELECT p.* FROM verification_prompts p
-            LEFT JOIN verification v ON v.uid=p.uid
-            WHERE v.uid IS NULL OR v.nonce!=p.nonce OR v.state='passed' OR p.expires<=?''',
-            (int(time.time()),)).fetchall()
-        for row in rows:
-            with self.db:
-                self.db.execute('DELETE FROM verification_prompts WHERE chat=? AND message_id=?',
-                                (row['chat'], row['message_id']))
-            self.schedule_delete(row['chat'], row['message_id'])
-
-    def pending_deletions(self):
-        return bool(self.db.execute('SELECT 1 FROM deletions LIMIT 1').fetchone() or
-                    (self.delete_after > 0 and
-                     self.db.execute('SELECT 1 FROM verification_prompts LIMIT 1').fetchone()))
+    def pending_verification(self):
+        """仍有待收尾的验证时缩短长轮询，让超时、批准和恢复重试及时执行。"""
+        return bool(self.db.execute(
+            "SELECT 1 FROM verification WHERE state='challenge' "
+            "OR (state='passed' AND ((kind='request' AND approved=0) "
+            "OR (kind='member' AND restored=0))) LIMIT 1").fetchone())
 
     # --- 权限与成员状态 ---------------------------------------------------
 
@@ -292,9 +226,6 @@ class Bot:
         if message.get('sender_chat'):
             # 频道身份发言不进入业务处理。
             return
-        if sender.get('is_bot') and sender.get('id') != self.bot_id and message.get('message_id'):
-            # 只有实际送达本机器人的其他 Bot 消息才能清理。
-            self.schedule_delete(chat_id, message['message_id'])
         for user in message.get('new_chat_members') or []:
             self.verification.admit(user, 'member', self.group, sender)
         if not sender or sender.get('id') == self.bot_id:
@@ -316,8 +247,7 @@ class Bot:
             self.bin_reply(message)
             return
         if name:
-            self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。',
-                      _delete_after=self.notice_seconds())
+            self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。')
 
     def foreign_command(self, message):
         """``/cmd@其他机器人`` 不是发给本机器人的命令。"""
@@ -343,7 +273,7 @@ class Bot:
         try:
             text = self.exchange.convert((message.get('text') or '').split()[1:])
         except RateError as exc:
-            self.send(chat, str(exc), _delete_after=self.notice_seconds())
+            self.send(chat, str(exc))
             return
         self.send(chat, text)
 
@@ -352,7 +282,7 @@ class Bot:
         try:
             text = self.bin_lookup.query((message.get('text') or '').split()[1:])
         except BinError as exc:
-            self.send(chat, str(exc), _delete_after=self.notice_seconds())
+            self.send(chat, str(exc))
             return
         self.send(chat, text)
 
@@ -380,13 +310,12 @@ class Bot:
     # --- 主循环 -----------------------------------------------------------
 
     # 每个后台任务的最短间隔；失败后统一冷却 30 秒起。
-    MAINTENANCE_TASKS = (('verification', 0), ('deletions', 0), ('processed', 600))
+    MAINTENANCE_TASKS = (('verification', 0), ('processed', 600))
     PROCESSED_LIMIT = 5000
 
     def maintenance(self):
         next_run = getattr(self, '_next_run', {})
         actions = {'verification': self.verification.tick,
-                   'deletions': self.sweep_deletions,
                    'processed': self.prune_processed}
         now = time.time()
         for name, interval in self.MAINTENANCE_TASKS:
@@ -434,7 +363,7 @@ class Bot:
         while True:
             try:
                 self.maintenance()
-                quick = self.pending_deletions()
+                quick = self.pending_verification()
                 updates = self.call('getUpdates', offset=offset, timeout=1 if quick else 20,
                                     allowed_updates=['message', 'chat_member', 'chat_join_request',
                                                      'callback_query'])
