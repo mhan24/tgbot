@@ -1,6 +1,6 @@
 # 配置、部署与维护
 
-核对日期：2026-11-04。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。当前版本包含入群验证和汇率/BIN 查询。
+核对日期：2026-11-05。本文是配置、部署与运维的唯一位置：环境变量、systemd、升级、备份和排查。功能规则见[功能与命令](FEATURES.md)，消息保留规则见 [AGENTS.md 第 3.1 节](../AGENTS.md)。生产路径由仓库 `tgbot.service` 定义；可按实际主机调整。
 
 ## 1. 运行条件
 
@@ -14,21 +14,20 @@ Python 3.9+，仅标准库。运行用户需要读配置、读写数据库，并
 | `TELEGRAM_CHANNEL` / `TELEGRAM_CHANNEL_URL` | “关注频道”按钮链接，可填 `@频道用户名` 或 t.me 链接；留空则卡片不显示该按钮 |
 | `TELEGRAM_GROUP` | 仅用于 `/start` 文案里的群名说明 |
 | `VERIFY_SECONDS` | 验证有效期，30–300 秒，默认 240；超出范围自动收敛 |
-| `DELETE_AFTER_SECONDS` | 群内机器人消息自动清理，0–3600 秒，默认 30；0 为关闭 |
 | `DB_PATH` | SQLite 路径，默认 `bot.sqlite3`；systemd 覆盖为 `/var/lib/tgbot/bot.sqlite3` |
 | `BIN_API_KEY` | 可选，cardbincheck.com（IPNOVA）的 BIN 查询密钥；留空按上游免费 IP 限流访问，配置后按额度计费 |
 | `SSH_HOST` / `SSH_PORT` / `SSH_USER` / `SSH_PASSWORD` | 可选本地部署连接信息，机器人运行不使用；不要复制到服务器运行配置 |
 
 复制 `.env.example` 为 `.env` 并设置权限 `600`（服务专用用户读取时为 `640` 且属组为服务组）。环境变量优先于文件配置。不要在 Git、日志或文档中保存真实 token 与密码。
 
-旧版 `.env` 中的 `JEV_*`、`MESSAGE_POINTS`、`MESSAGE_DAILY_LIMIT`、`UPGRADE_*`、`MUTE_SECONDS` 已不再读取，可择机清理，不清理也不影响运行。
+旧版 `.env` 中的 `JEV_*`、`MESSAGE_POINTS`、`MESSAGE_DAILY_LIMIT`、`UPGRADE_*`、`MUTE_SECONDS`、`DELETE_AFTER_SECONDS` 已不再读取，可择机清理，不清理也不影响运行，更不会导致消息被自动删除。
 
 ## 2. 群与频道权限
 
 机器人必须是默认群和验证频道的管理员：
 
 - 频道：能读取成员状态（`getChatMember`）。
-- 群：删除消息、限制成员、邀请成员（`can_delete_messages`、`can_restrict_members`、`can_invite_users`）。群主身份无需这些权限。
+- 群：限制成员、邀请成员、撤回消息（`can_restrict_members`、`can_invite_users`、`can_delete_messages`）。群主身份无需这些权限。机器人不删除自己发的消息，撤回权限只用于处罚移出成员时的 `revoke_messages`。
 
 建议在群里开启“入群申请”，让验证在私聊完成；否则成员直接进群，由机器人先禁言再在群内验证。启动时会校验以上权限，缺少权限将直接退出并报错。
 
@@ -62,7 +61,7 @@ systemctl is-active tgbot
 journalctl -u tgbot -n 50 --no-pager
 ```
 
-启动日志应包含 `Started @用户名 group=群ID`。功能验证建议用自己的测试账号申请入群，确认：私聊收到卡片、未关注时提示先关注、答对后自动批准、答错 3 次或超时被拒绝、验证卡片在结束后按 30 秒清理。
+启动日志应包含 `Started @用户名 group=群ID`。功能验证建议用自己的测试账号申请入群，确认：私聊收到卡片、未关注时提示先关注、答对后自动批准、答错 3 次或超时被拒绝、验证卡片结束后文案改为结果且消息仍保留在聊天里。
 
 菜单文案变化后运行 `python3 scripts/update_commands.py`（只更新已有菜单，不发送群消息），再用 Telegram 客户端确认命令菜单为 `/start`、`/help`、`/rate`、`/bin`。
 
@@ -72,13 +71,13 @@ journalctl -u tgbot -n 50 --no-pager
 
 ```sh
 systemctl stop tgbot
-sqlite3 /var/lib/tgbot/bot.sqlite3 \
-  'DROP TABLE IF EXISTS verification; DROP TABLE IF EXISTS verification_prompts;'
+sqlite3 /var/lib/tgbot/bot.sqlite3 'DROP TABLE IF EXISTS verification;'
 # 上传新代码后
 systemctl start tgbot
 ```
 
-- 更彻底的方式（本次重构采用）：停服后直接删除数据库文件，机器人启动时重建全部 6 张表：
+- 旧版残留的 `verification_prompts`、`deletions` 表已无代码读写，可在同一次停服中一并 `DROP`（两表只存消息 ID 与到期时间，不含业务数据）。
+- 更彻底的方式：停服后直接删除数据库文件，机器人启动时重建全部 6 张表：
 
   ```sh
   systemctl stop tgbot
@@ -87,7 +86,6 @@ systemctl start tgbot
   ```
 
 - 删除数据库即丢失全部验证记录、处理位置和审计记录；进行中的申请人需要重新申请，已通过验证的成员重新进群会再验证一次。
-- 本次重构按用户要求**没有保留旧库、旧表和备份**：服务器上旧版备份目录与旧代码一起删除，`.env` 未改动。
 - 结构不匹配时服务会启动失败并报 `verification table has an incompatible schema`，按上面步骤重建数据库即可。
 
 ## 6. 备份与恢复
@@ -105,10 +103,9 @@ systemctl start tgbot
 | 现象 | 排查方向 |
 |---|---|
 | 启动报 `Bot must be administrator in channel` | 机器人未加入频道或不是频道管理员 |
-| 启动报 `Missing administrator right ...` | 群内管理员权限缺少删除消息、限制成员或邀请成员 |
+| 启动报 `Missing administrator right ...` | 群内管理员权限缺少限制成员、邀请成员或撤回消息 |
 | 申请后收不到验证卡片 | 用户与机器人私聊被拦截（`Forbidden: bot can't initiate conversation`）；此时申请会被拒绝并记录审计，用户需先私聊机器人发 `/start` |
 | 直接进群的成员无法发言 | 正在等待验证；答对后自动恢复，超时会被移出 |
-| 验证卡片没有清理 | `DELETE_AFTER_SECONDS=0` 关闭了清理；恢复为非 0 后重启 |
 | 日志出现 `Verification conclusion deferred` | 机器人缺少限制/邀请权限或 Telegram 暂时失败；记录保留并每 30 秒重试 |
 | 日志出现 `Restore permissions failed` | 恢复发言失败，后台每 30 秒重试，最多 5 次；随后写 `verification_restore_gaveup` 审计并停止，需在 Telegram 手动解除限制 |
 | 日志出现 `Polling conflict` | 有另一个进程用同一 token 在轮询（Telegram 返回 409）；停掉多余实例 |

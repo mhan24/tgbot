@@ -1,6 +1,6 @@
 # Telegram 入群验证机器人
 
-从零重构的版本，使用 Python 3.9+ 标准库与 SQLite，实现入群验证和两个免费工具查询。
+Python 3.9+ 标准库 + SQLite 的单群机器人：入群验证、汇率换算、卡 BIN 查询。机器人不自动删除任何消息。
 
 ## 现有功能
 
@@ -12,8 +12,9 @@
 | 提示 | `/help` 在群和私聊说明验证步骤与规则，`/start` 私聊说明入群流程 |
 | 汇率换算 | `/rate 100 USD CNY`，或 `/rate USD CNY`；exchangerate.fun 免钥接口，USD 基准缓存 1 小时，显示数据时间 |
 | 卡 BIN 查询 | `/bin 45717360`（6–8 位数字）；cardbincheck.com（IPNOVA）接口，密钥可选，成功结果缓存 24 小时，缺失字段显示未知 |
+| 消息保留 | 机器人不自动删除任何消息；验证卡片结束只改文案；唯一删除场景是处罚移出成员时撤回其发言 |
 
-验证规则：算术题为两位数加法四选一；有效期由 `VERIFY_SECONDS` 决定（默认 240 秒）；最多答错 3 次。未关注频道时点击答案只提示先关注，不消耗答错次数，也不会通过验证。验证卡片在验证期间保留，结束（通过、答错上限、超时）后按群自动清理时长删除。
+验证规则：算术题为两位数加法四选一；有效期由 `VERIFY_SECONDS` 决定（默认 240 秒）；最多答错 3 次。未关注频道时点击答案只提示先关注，不消耗答错次数，也不会通过验证。完整规则见[功能与命令](docs/FEATURES.md)。
 
 ## 快速启动
 
@@ -27,53 +28,68 @@ python3 -m unittest discover -s tests -q
 python3 bot.py
 ```
 
-运行前把机器人设为群和关联频道的管理员，群内需要删除消息、限制成员、邀请成员权限。群应开启“入群申请”，否则成员会直接进群走禁言验证流程。不要同时运行多个轮询同一 token 的实例。
+运行前把机器人设为群和关联频道的管理员：频道用于读取成员状态，群内用于限制成员、邀请成员和撤回消息。群应开启“入群申请”，否则成员会直接进群走禁言验证流程。不要同时运行多个轮询同一 token 的实例。
 
-### 配置
+## 配置
 
-| 环境变量 | 用途 |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | 必填，机器人 token |
-| `GROUP_ID` / `CHANNEL_ID` | 必填，默认群与验证频道的数字 ID |
-| `TELEGRAM_CHANNEL` / `TELEGRAM_CHANNEL_URL` | 验证卡片的“关注频道”按钮链接，可填 `@频道用户名` 或 t.me 链接；留空时不显示该按钮 |
-| `VERIFY_SECONDS` | 验证有效期，30–300 秒，默认 240 |
-| `DELETE_AFTER_SECONDS` | 群内机器人消息自动清理秒数，0 关闭，默认 30 |
-| `DB_PATH` | SQLite 路径，默认 `bot.sqlite3` |
+必填 `TELEGRAM_BOT_TOKEN`、`GROUP_ID`、`CHANNEL_ID`；常用可选项是验证卡片链接 `TELEGRAM_CHANNEL`、有效期 `VERIFY_SECONDS` 和 BIN 查询密钥 `BIN_API_KEY`。全部环境变量及默认值只维护在[配置与部署](docs/DEPLOYMENT.md#1-运行条件)，这里不重复。
 
 所有参数来自 `.env` / 环境变量，修改后需重启服务；机器人内没有配置命令。
 
-本项目**不做迁移、不做兼容**：数据库只创建当前结构，没有 `ALTER TABLE` 或旧数据搬迁分支；表结构不符时启动会直接报错并提示重建表，升级步骤见[部署文档第 5 节](docs/DEPLOYMENT.md#5-从旧版本升级破坏性无迁移)。
+## 代码结构
 
-## 代码导航
+| 模块 | 职责 |
+|---|---|
+| `bot.py` | 配置读取、Telegram 调用封装、单群过滤、更新分发、`/start`、`/help`、`/rate`、`/bin`、权限与成员状态、长轮询主循环 |
+| `verification.py` | 验证状态机：发题、判题、批准或拒绝、超时与答错处理、投递和恢复重试 |
+| `exchange.py` | `/rate` 汇率换算：exchangerate.fun 拉取、USD 基准 1 小时缓存、Decimal 交叉换算、参数与币种校验 |
+| `binlookup.py` | `/bin` 卡 BIN 查询：cardbincheck.com 拉取、可选鉴权、成功结果 24 小时缓存、字段映射与缺失兜底 |
+| `botapi.py` | Bot API 传输层：请求、响应解析、`APIError`（`code`、`description`、`retry_after`、`permanent`） |
+| `scripts/` | 命令菜单维护：`command_descriptions.json` 与 `update_commands.py` |
+| `tests/` | 模拟 Telegram API 与内存 SQLite 的回归测试 |
 
-- [bot.py](bot.py)：配置、Telegram 调用、单群过滤、消息生命周期、更新分发与长轮询。
-- [verification.py](verification.py)：验证状态机（发题、判题、通过、超时/答错拒绝、投递与恢复重试）。
-- [exchange.py](exchange.py)、[binlookup.py](binlookup.py)：汇率换算与卡 BIN 查询，各自维护缓存表。
-- [botapi.py](botapi.py)：Bot API 传输层，区分可重试与永久失败。
-- [retention.py](retention.py)：失败与处罚通知的显式保留时长。
-- [scripts](scripts)：命令菜单说明维护；[tests](tests)：使用模拟 Telegram 与内存 SQLite 的回归测试。
+```text
+getUpdates → 只接受默认群与用户私聊 → 分发（callback_query / chat_join_request / chat_member / message）
+  → 验证服务处理入群与答题；/rate、/bin 在命令线程内同步处理（10 秒超时）
+  → 后台维护：验证超时与重试、更新 ID 修剪
+  → 保存处理位置，继续长轮询
+```
 
-### 外部服务
+`Bot.call()` 统一发送请求：`banChatMember` 强制携带 `revoke_messages`，`answerCallbackQuery` 的“query is too old”视为已处理。`Bot.send()` 是唯一发送入口，默认 HTML 解析模式，不设置删除任务。
+
+## 数据
+
+单群部署，一个 SQLite 数据库（默认 `bot.sqlite3`，systemd 使用 `/var/lib/tgbot/`），WAL 模式，共 6 张表。
+
+| 表 | 用途 |
+|---|---|
+| `meta` | 处理位置 `offset`、启动时间 |
+| `processed` | 已处理更新 ID，防止重复处理 |
+| `audit` | 操作与判决记录（谁对谁做了什么） |
+| `verification` | 每人一行验证状态：题目、答案、随机串、有效期、答错次数、`state`、投递与恢复重试字段 |
+| `rates` | 汇率缓存：USD 基准的完整汇率表、上游数据时间与拉取时间 |
+| `bin_cache` | BIN 缓存：已成功查询的原始 JSON，24 小时内复用 |
+
+表结构只由当前代码创建，没有 `ALTER TABLE` 或旧数据搬迁分支；`verification` 表结构不符时 `Bot` 直接抛 `RuntimeError` 并提示删除该表后重启。旧版残留的 `deletions`、`verification_prompts` 已无代码读写，可以 `DROP`。
+
+## 外部服务
 
 | 接口 | 用途 |
 |---|---|
 | `api.exchangerate.fun/latest` | 汇率数据，免费免钥，每小时更新 |
 | `cardbincheck.com/api/bin/{bin}` | BIN 数据（IPNOVA），`BIN_API_KEY` 可选：配置后按额度计费，未配置按 IP 限流；成功结果缓存 24 小时 |
 
-两个上游在命令处理线程内同步调用（10 秒超时）；失败有明确提示，不使用过期缓存伪造结果。参考过的 freebinchecker 公开 API 目前被 Cloudflare 人机验证拦截，服务端不可用，故未采用。
+两个上游在命令处理线程内同步调用（10 秒超时）；失败有明确提示，不使用过期缓存伪造结果。
 
 ## 文档与维护
 
 | 文档 | 内容 |
 |---|---|
-| [开发约束](AGENTS.md) | 开发范围、权限、数据、测试与部署要求 |
-| [功能规则](docs/FEATURES.md) | 验证流程、放行条件、限制和未实现项 |
-| [命令与权限](docs/COMMANDS.md) | 当前命令、按钮与权限 |
-| [代码结构](docs/ARCHITECTURE.md) | 模块职责、表结构、重试与数据隔离 |
-| [消息保留规范](docs/MESSAGE_RETENTION.md) | 消息生命周期要求与接入检查 |
-| [配置与部署](docs/DEPLOYMENT.md) | 环境变量、systemd、备份与排查 |
+| [开发约束](AGENTS.md) | 开发范围、权限、数据、消息保留规则、测试与部署要求 |
+| [功能与命令](docs/FEATURES.md) | 验证流程、命令与按钮、权限、失败恢复、限制 |
+| [配置与部署](docs/DEPLOYMENT.md) | 环境变量、systemd、升级、备份与排查 |
 
-`.env`、密钥、SQLite 数据和运行日志不提交。菜单说明变化后运行 `python3 scripts/update_commands.py`；该脚本只刷新已有菜单，不是从零初始化工具。
+`.env`、密钥、SQLite 数据和运行日志不提交。菜单文案变化后运行 `python3 scripts/update_commands.py`；该脚本只刷新已有菜单，不是从零初始化工具。
 
 ## 测试
 
@@ -81,4 +97,4 @@ python3 bot.py
 python3 -m unittest discover -s tests -q
 ```
 
-测试使用模拟 Telegram API 与内存 SQLite，覆盖频道校验顺序、答错次数、超时拒绝、重复入群、直接入群禁言与恢复、群隔离、投递失败重试、卡片清理与消息保留时长。
+测试使用模拟 Telegram API 与内存 SQLite，覆盖频道校验顺序、答错次数、超时拒绝、重复入群、直接入群禁言与恢复、群隔离、投递失败重试、卡片保留与不删除消息。
