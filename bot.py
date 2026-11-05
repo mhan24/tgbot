@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 
+from ai import AI, AIError
+from ai import NO_KEY as AI_NO_KEY, USAGE as AI_USAGE
 from binlookup import BinError, BinLookup
 from botapi import API, APIError
 from exchange import Exchange, RateError
@@ -67,6 +70,19 @@ class Bot:
         self.verification = Verification(self)
         self.exchange = Exchange(self.db)
         self.bin_lookup = BinLookup(self.db, api_key=cfg.get('BIN_API_KEY', ''))
+        self.ai = AI(api_base=cfg.get('AI_API_BASE', ''), api_key=cfg.get('AI_API_KEY', ''),
+                     model=cfg.get('AI_MODEL', ''), exa_key=cfg.get('EXA_API_KEY', ''),
+                     timeout=self._bounded(cfg.get('AI_TIMEOUT'), 60, 10, 180),
+                     typesafe_key=cfg.get('TYPESAFE_API_KEY', ''),
+                     typesafe_model=cfg.get('TYPESAFE_MODEL', ''))
+        self.ai_sticker = (cfg.get('AI_THINKING_STICKER') or '').strip()
+        # 问答在后台线程执行，这里只保存并发与冷却状态，不访问数据库。
+        self._ai_lock = threading.Lock()
+        self._ai_running = 0
+        self._ai_last = {}
+        # 最近几条文字消息只留在内存里，供 /ai 引用目标消息与上文；不写数据库。
+        self._recent_lock = threading.Lock()
+        self._recent = {}
         self.username = ''
         self.bot_id = 0
 
@@ -106,6 +122,30 @@ class Bot:
     def send(self, chat, text, **kwargs):
         """唯一的发送入口；机器人发出的消息一律保留在聊天里。"""
         return self.call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', **kwargs)
+
+    def send_sticker(self, chat, sticker, reply_to=0):
+        """贴纸同样走封装发送；和 Bot.send 一样不安排任何删除。"""
+        payload = {'chat_id': chat, 'sticker': sticker}
+        if reply_to:
+            payload['reply_to_message_id'] = reply_to
+            payload['allow_sending_without_reply'] = True
+        return self.call('sendSticker', **payload)
+
+    def ai_thinking(self, chat, message_id):
+        """在提问上标记“正在回答”：优先贴纸，未配置或失败时用表情回应。"""
+        if not message_id:
+            return
+        if self.ai_sticker:
+            try:
+                self.send_sticker(chat, self.ai_sticker, message_id)
+                return
+            except APIError as exc:
+                LOG.warning('Thinking sticker failed code=%s', exc.code)
+        try:
+            self.call('setMessageReaction', chat_id=chat, message_id=message_id,
+                      reaction=[{'type': 'emoji', 'emoji': self.AI_THINKING_REACTION}])
+        except APIError as exc:
+            LOG.info('Thinking reaction failed code=%s', exc.code)
 
     def pending_verification(self):
         """仍有待收尾的验证时缩短长轮询，让超时、批准和恢复重试及时执行。"""
@@ -149,6 +189,48 @@ class Bot:
         return status in ('creator', 'administrator', 'member') or (
             status == 'restricted' and bool(member.get('is_member')))
 
+    # --- 消息上下文 -------------------------------------------------------
+
+    @staticmethod
+    def display_name(user):
+        user = user or {}
+        name = str(user.get('first_name') or '').strip() or '成员'
+        username = str(user.get('username') or '').strip()
+        return f'{name}（@{username}）' if username else name
+
+    def remember(self, message):
+        """记住群/私聊里最近的文字消息，供 /ai 引用目标消息和上文。"""
+        chat = (message.get('chat') or {}).get('id')
+        sender = message.get('from') or {}
+        text = (message.get('text') or '').strip()
+        if (not chat or not text or text.startswith('/') or message.get('sender_chat')
+                or sender.get('is_bot') or sender.get('id') == self.bot_id):
+            return
+        entry = {'id': int(message.get('message_id') or 0),
+                 'author': self.display_name(sender),
+                 'text': text[:self.AI_CONTEXT_CHARS]}
+        with self._recent_lock:
+            items = self._recent.setdefault(chat, [])
+            if items and items[-1]['id'] == entry['id']:
+                return
+            items.append(entry)
+            del items[:-self.AI_HISTORY * 2]
+
+    def ai_context(self, message):
+        """被回复的目标消息 + 它之前的几条消息；没有引用时只取提问前的上文。"""
+        chat = message['chat']['id']
+        quoted = message.get('reply_to_message') or {}
+        anchor = int(quoted.get('message_id') or message.get('message_id') or 0)
+        with self._recent_lock:
+            items = [item for item in self._recent.get(chat, ()) if item['id'] < anchor]
+        lines = []
+        quoted_text = (quoted.get('text') or '').strip()
+        if quoted_text:
+            lines.append(f'[引用] {self.display_name(quoted.get("from") or {})}：'
+                         f'{quoted_text[:self.AI_CONTEXT_CHARS]}')
+        lines.extend(f'[上文] {item["author"]}：{item["text"]}' for item in items[-self.AI_HISTORY:])
+        return lines
+
     # --- 更新分发 ---------------------------------------------------------
 
     def accepts_update(self, update):
@@ -183,6 +265,7 @@ class Bot:
         message = update.get('message')
         if not message:
             return
+        self.remember(message)
         if (message.get('chat') or {}).get('type') == 'private':
             self.private_message(message)
         else:
@@ -216,6 +299,8 @@ class Bot:
             self.rate_reply(message)
         elif name == '/bin':
             self.bin_reply(message)
+        elif name == '/ai':
+            self.ai_reply(message)
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
@@ -245,6 +330,9 @@ class Bot:
             return
         if name == '/bin':
             self.bin_reply(message)
+            return
+        if name == '/ai':
+            self.ai_reply(message)
             return
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。')
@@ -286,6 +374,82 @@ class Bot:
             return
         self.send(chat, text)
 
+    # --- AI 问答（后台线程） ----------------------------------------------
+
+    AI_CONCURRENCY = 2      # 同时生成中的回答
+    AI_PENDING = 6          # 进行中 + 排队上限，超出直接提示稍后再试
+    AI_COOLDOWN = 15        # 同一用户两次提问的最小间隔（秒）
+    AI_HISTORY = 5          # /ai 引用的上文条数
+    AI_CONTEXT_CHARS = 500  # 单条上下文截断长度
+    AI_THINKING_REACTION = '🤔'   # 思考中的表情回应；配置了 AI_THINKING_STICKER 时改用贴纸
+    AI_FAILED = '⚠️ AI 问答失败，请稍后重试。'
+
+    def ai_reply(self, message):
+        """AI 问答放到后台线程：模型与搜索都慢，不能阻塞长轮询。"""
+        chat = message['chat']['id']
+        uid = int((message.get('from') or {}).get('id') or 0)
+        parts = (message.get('text') or '').split(maxsplit=1)
+        question = parts[1].strip() if len(parts) > 1 else ''
+        if not question:
+            self.send(chat, AI_USAGE)
+            return
+        if not self.ai.enabled:
+            self.send(chat, AI_NO_KEY)
+            return
+        now = time.time()
+        with self._ai_lock:
+            if len(self._ai_last) > 500:
+                self._ai_last = {key: stamp for key, stamp in self._ai_last.items()
+                                 if now - stamp < 3600}
+            waiting = now - self._ai_last.get(uid, 0)
+            if waiting < self.AI_COOLDOWN:
+                refusal = f'提问太频繁，请 {int(self.AI_COOLDOWN - waiting) + 1} 秒后再试。'
+            elif self._ai_running >= self.AI_CONCURRENCY + self.AI_PENDING:
+                refusal = '当前提问较多，请稍后再试。'
+            else:
+                refusal = ''
+                self._ai_last[uid] = now
+                self._ai_running += 1
+        if refusal:
+            self.send(chat, refusal)
+            return
+        message_id = message.get('message_id')
+        self.ai_thinking(chat, message_id)
+        context = self.ai_context(message)
+        try:
+            threading.Thread(target=self._ai_worker, args=(chat, question, message_id, context),
+                             daemon=True).start()
+        except RuntimeError:
+            with self._ai_lock:
+                self._ai_running = max(0, self._ai_running - 1)
+            self._ai_send(chat, message_id, self.AI_FAILED)
+
+    def _ai_worker(self, chat, question, message_id, context=None):
+        """后台线程：只发起 HTTP 调用，不碰主循环使用的 SQLite 连接。"""
+        try:
+            try:
+                text = self.ai.ask(question, context=context)
+            except AIError as exc:
+                LOG.warning('AI answer failed code=%s', getattr(exc, 'code', 0))
+                text = f'⚠️ {exc}'
+            except Exception:
+                LOG.exception('AI worker failed')
+                text = self.AI_FAILED
+            self._ai_send(chat, message_id, text)
+        finally:
+            with self._ai_lock:
+                self._ai_running = max(0, self._ai_running - 1)
+
+    def _ai_send(self, chat, message_id, text):
+        """回答作为引用提问的回复发出；提问已被删除时照常发送，消息一律保留。"""
+        payload = {}
+        if message_id:
+            payload = {'reply_to_message_id': message_id, 'allow_sending_without_reply': True}
+        try:
+            self.send(chat, text, **payload)
+        except APIError as exc:
+            LOG.warning('AI answer delivery failed code=%s', exc.code)
+
     # --- 说明文案 ---------------------------------------------------------
 
     def help_text(self):
@@ -300,7 +464,8 @@ class Bot:
                 '/start — 私聊开始使用\n'
                 '/help — 查看本说明\n'
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
-                '/bin — 卡 BIN 查询：/bin 45717360')
+                '/bin — 卡 BIN 查询：/bin 45717360\n'
+                '/ai — AI 问答（可联网搜索）：/ai SQLite 的 WAL 模式有什么代价？')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'
