@@ -142,21 +142,28 @@ class AI:
                     search_state = 'failed'
         if context:
             messages.append({'role': 'system', 'content': CONTEXT + '\n' + '\n'.join(context)})
-        if image:
+        image_part = self._image_part(image) if image else None
+        if image and image_part is None:
+            LOG.info('Unsupported image format; answering text-only')
+            messages.append({'role': 'system', 'content':
+                             '图片因格式不支持没有发送给你：不要猜测图片内容，如实说明看不到图片即可。'})
+        if image_part:
             messages.append({'role': 'user', 'content': [
-                {'type': 'text', 'text': question}, self._image_part(image)]})
+                {'type': 'text', 'text': question}, image_part]})
         else:
             messages.append({'role': 'user', 'content': question})
         try:
             answer, model = self._answer(messages)
         except AIError as exc:
             # 网关/模型按 4xx 拒绝图片输入时降级为纯文字回答，不再当作故障。
-            if image is None or exc.code not in (400, 404, 422):
+            if not image_part or exc.code not in (400, 404, 422):
                 raise
             LOG.warning('Model rejected image input code=%s; falling back to text-only', exc.code)
             messages[-1] = {'role': 'user', 'content': question}
             answer, model = self._answer(messages)
             answer += '\n\n⚠️ 附图未被模型识别，本次仅按文字回答。'
+        if image and image_part is None:
+            answer += '\n\n⚠️ 附图为不支持的格式，本次仅按文字回答。'
         text = html.escape(self._strip_markdown(answer))
         if search_failed:
             text += '\n\n⚠️ ' + SEARCH_FAILED
@@ -172,8 +179,17 @@ class AI:
 
     @staticmethod
     def _image_part(data):
-        """图片字节 → OpenAI 兼容 image_url 内容；按字节特征判断 MIME。"""
-        mime = 'image/png' if data[:4] == b'\x89PNG' else 'image/jpeg'
+        """图片字节 → OpenAI 兼容 image_url 内容；只支持 PNG/JPEG，其余返回 None。
+
+        Telegram 的 photo 一定是 JPEG；document 可能带 GIF/WebP 等格式，
+        网关不接受时整次请求会 400，因此不支持的类型直接不发给模型。
+        """
+        if data[:4] == b'\x89PNG':
+            mime = 'image/png'
+        elif data[:2] == b'\xff\xd8':
+            mime = 'image/jpeg'
+        else:
+            return None
         return {'type': 'image_url',
                 'image_url': {'url': 'data:%s;base64,' % mime + base64.b64encode(data).decode()}}
 
@@ -210,13 +226,14 @@ class AI:
 
     def _answer(self, messages):
         data = self._chat(messages)
-        answer = self._content(data)
+        answer = self._content(data) or self._reasoning(data)
         if not answer:
-            # 网关偶尔只返回推理过程、没有正文：给一次明确的收尾机会，仍为空才报错。
+            # 网关偶尔只返回推理过程、没有正文：先直接用推理内容兜底；
+            # 推理也没有时才补一次收尾请求，仍为空才报错。
             LOG.info('Empty answer from model; asking for a final reply once')
             data = self._chat(messages + [{
                 'role': 'user', 'content': '请直接给出最终回答，不要输出推理过程。'}])
-            answer = self._content(data)
+            answer = self._content(data) or self._reasoning(data)
         if not answer:
             raise AIError(EMPTY)
         return answer, str(data.get('model') or self.model)
@@ -246,6 +263,12 @@ class AI:
         choices = data.get('choices') or []
         message = ((choices[0] or {}).get('message') if choices else None) or {}
         return str(message.get('content') or '').strip()
+
+    @staticmethod
+    def _reasoning(data):
+        choices = data.get('choices') or []
+        message = ((choices[0] or {}).get('message') if choices else None) or {}
+        return str(message.get('reasoning_content') or '').strip()
 
     # --- 联网搜索 ---------------------------------------------------------
 
