@@ -335,6 +335,10 @@ class Bot:
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
+        else:
+            question = self.mention_question(message)
+            if question is not None:
+                self.ai_reply(message, question)
 
     def group_message(self, message):
         chat_id = message['chat']['id']
@@ -362,9 +366,12 @@ class Bot:
         if name == '/bin':
             self.bin_reply(message)
             return
-        if name == '/ai':
-            self.ai_reply(message)
-            return
+        if not name:
+            # /ai 在群里改为 @机器人 触发：提及即提问，问题取去掉提及后的正文。
+            question = self.mention_question(message)
+            if question is not None:
+                self.ai_reply(message, question)
+                return
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。')
 
@@ -384,6 +391,59 @@ class Bot:
         if len(name) > 1 and self.username and name[1].lower() != self.username.lower():
             return ''
         return name[0].lower()
+
+    @staticmethod
+    def _entity_span(text, offset, length):
+        """Telegram 实体偏移按 UTF-16 码元计数，换算成本文按码点的切片区间。"""
+        units = 0
+        start = end = len(text)
+        for index, char in enumerate(text):
+            if units == offset:
+                start = index
+            if units == offset + length:
+                end = index
+                break
+            units += 2 if ord(char) > 0xFFFF else 1
+        else:
+            if units == offset:
+                start = len(text)
+            if units <= offset + length:
+                end = len(text)
+        return start, end
+
+    def mention_question(self, message):
+        """消息 @ 本机器人时返回去掉提及后的问题；未提及返回 None，提及但无正文返回空串。
+
+        群聊里 @机器人 即视为 AI 提问，正文与图片说明（caption）都支持。
+        """
+        if 'text' in message:
+            text = message.get('text') or ''
+            entities = message.get('entities') or []
+        else:
+            text = message.get('caption') or ''
+            entities = message.get('caption_entities') or []
+        if not text:
+            return None
+        spans = []
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            offset = int(entity.get('offset') or 0)
+            length = int(entity.get('length') or 0)
+            kind = entity.get('type')
+            matched = False
+            if kind == 'mention':
+                start, end = self._entity_span(text, offset, length)
+                matched = text[start:end].lower() == '@' + self.username.lower()
+            elif kind == 'text_mention':
+                matched = int((entity.get('user') or {}).get('id') or 0) == self.bot_id
+            if matched:
+                spans.append(self._entity_span(text, offset, length))
+        if not spans:
+            return None
+        for start, end in sorted(spans, reverse=True):
+            text = text[:start] + text[end:]
+        return ' '.join(text.split()).strip(' ，。,:：!！?？~～')
 
     # --- 工具查询 ---------------------------------------------------------
 
@@ -416,12 +476,19 @@ class Bot:
     AI_THINKING_REACTION = '🤔'   # 思考中的表情回应；配置了 AI_THINKING_STICKER 时改用贴纸
     AI_FAILED = '⚠️ AI 问答失败，请稍后重试。'
 
-    def ai_reply(self, message):
-        """AI 问答放到后台线程：模型与搜索都慢，不能阻塞长轮询。"""
+    def ai_reply(self, message, question=None):
+        """AI 问答放到后台线程：模型与搜索都慢，不能阻塞长轮询。
+
+        ``question`` 已由调用方给出（如群聊 @机器人 提及）时直接用；
+        未给出时按 /ai 命令解析。
+        """
         chat = message['chat']['id']
         uid = int((message.get('from') or {}).get('id') or 0)
-        parts = (message.get('text') or '').split(maxsplit=1)
-        question = parts[1].strip() if len(parts) > 1 else ''
+        if question is None:
+            parts = (message.get('text') or '').split(maxsplit=1)
+            question = parts[1].strip() if len(parts) > 1 else ''
+        else:
+            question = (question or '').strip()
         if not question:
             self.send(chat, AI_USAGE)
             return
@@ -503,7 +570,7 @@ class Bot:
                 '/help — 查看本说明\n'
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
                 '/bin — 卡 BIN 查询：/bin 45717360\n'
-                '/ai — AI 问答（可联网搜索）：/ai SQLite 的 WAL 模式有什么代价？')
+                f'/ai — AI 问答（可联网搜索）：群里 @{html.escape(self.username)} 提问，私聊用 /ai 你的问题')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'
