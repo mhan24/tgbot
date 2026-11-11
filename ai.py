@@ -37,7 +37,7 @@ RETRY_DELAY = 1.5  # 网关超时、5xx 或 429 后的重试延时（秒），�
 # 与 exchange.py 一致：网关会拦截默认的 Python-urllib UA，请求必须带自定义 UA。
 USER_AGENT = 'tgbot/1.0'
 
-USAGE = '用法：/ai 你的问题，例如 /ai SQLite 的 WAL 模式有什么代价？群里也可以直接 @机器人 提问。'
+USAGE = '用法：@机器人 你的问题，例如 @机器人 SQLite 的 WAL 模式有什么代价？'
 NO_KEY = 'AI 问答未配置：请在 .env 设置 AI_API_KEY 后重启服务。'
 UNAVAILABLE = 'AI 服务暂时不可用，请稍后重试。'
 EMPTY = 'AI 没有返回内容，请换个问法或稍后重试。'

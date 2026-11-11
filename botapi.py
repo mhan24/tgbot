@@ -58,7 +58,7 @@ class API:
         return payload['result']
 
     def download(self, file_path):
-        """下载 getFile 给出的文件路径，返回 bytes；失败抛 APIError（/ai 图片识别用）。"""
+        """下载 getFile 给出的文件路径，返回 bytes；失败抛 APIError（AI 图片识别用）。"""
         request = urllib.request.Request(self.file_base + file_path)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:

@@ -81,7 +81,7 @@ class Bot:
         self._ai_lock = threading.Lock()
         self._ai_running = 0
         self._ai_last = {}
-        # 最近几条文字消息只留在内存里，供 /ai 引用目标消息与上文；不写数据库。
+        # 最近几条文字消息只留在内存里，供 AI 引用目标消息与上文；不写数据库。
         self._recent_lock = threading.Lock()
         self._recent = {}
         self.username = ''
@@ -133,7 +133,7 @@ class Bot:
         return self.call('sendSticker', **payload)
 
     def download(self, file_path):
-        """下载 Telegram 文件内容（/ai 图片识别用）；失败抛 APIError，由调用方降级。"""
+        """下载 Telegram 文件内容（AI 图片识别用）；失败抛 APIError，由调用方降级。"""
         return self.api.download(file_path)
 
     def ai_thinking(self, chat, message_id):
@@ -204,7 +204,7 @@ class Bot:
         return f'{name}（@{username}）' if username else name
 
     def remember(self, message):
-        """记住群/私聊里最近的文字消息，供 /ai 引用目标消息和上文。"""
+        """记住群/私聊里最近的文字消息，供 AI 引用目标消息和上文。"""
         chat = (message.get('chat') or {}).get('id')
         sender = message.get('from') or {}
         text = (message.get('text') or '').strip()
@@ -330,15 +330,9 @@ class Bot:
             self.rate_reply(message)
         elif name == '/bin':
             self.bin_reply(message)
-        elif name == '/ai':
-            self.ai_reply(message)
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
-        else:
-            question = self.mention_question(message)
-            if question is not None:
-                self.ai_reply(message, question)
 
     def group_message(self, message):
         chat_id = message['chat']['id']
@@ -367,7 +361,7 @@ class Bot:
             self.bin_reply(message)
             return
         if not name:
-            # /ai 在群里改为 @机器人 触发：提及即提问，问题取去掉提及后的正文。
+            # AI 问答只通过群聊 @机器人 触发：提及即提问，问题取去掉提及后的正文。
             question = self.mention_question(message)
             if question is not None:
                 self.ai_reply(message, question)
@@ -470,25 +464,20 @@ class Bot:
     AI_CONCURRENCY = 2      # 同时生成中的回答
     AI_PENDING = 6          # 进行中 + 排队上限，超出直接提示稍后再试
     AI_COOLDOWN = 15        # 同一用户两次提问的最小间隔（秒）
-    AI_HISTORY = 5          # /ai 引用的聊天记录条数
+    AI_HISTORY = 5          # AI 引用的聊天记录条数
     AI_CONTEXT_CHARS = 500  # 单条上下文截断长度
     AI_IMAGE_BYTES = 5 * 1024 * 1024  # 被引用图片文件的大小上限，超出不识别
     AI_THINKING_REACTION = '🤔'   # 思考中的表情回应；配置了 AI_THINKING_STICKER 时改用贴纸
     AI_FAILED = '⚠️ AI 问答失败，请稍后重试。'
 
-    def ai_reply(self, message, question=None):
-        """AI 问答放到后台线程：模型与搜索都慢，不能阻塞长轮询。
+    def ai_reply(self, message, question):
+        """群聊 AI 问答放到后台线程：模型与搜索都慢，不能阻塞长轮询。
 
-        ``question`` 已由调用方给出（如群聊 @机器人 提及）时直接用；
-        未给出时按 /ai 命令解析。
+        ``question`` 是去掉 @机器人 提及后的问题文本。
         """
         chat = message['chat']['id']
         uid = int((message.get('from') or {}).get('id') or 0)
-        if question is None:
-            parts = (message.get('text') or '').split(maxsplit=1)
-            question = parts[1].strip() if len(parts) > 1 else ''
-        else:
-            question = (question or '').strip()
+        question = (question or '').strip()
         if not question:
             self.send(chat, AI_USAGE)
             return
@@ -569,8 +558,9 @@ class Bot:
                 '/start — 私聊开始使用\n'
                 '/help — 查看本说明\n'
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
-                '/bin — 卡 BIN 查询：/bin 45717360\n'
-                f'/ai — AI 问答（可联网搜索）：群里 @{html.escape(self.username)} 提问，私聊用 /ai 你的问题')
+                '/bin — 卡 BIN 查询：/bin 45717360\n\n'
+                '<b>AI 问答</b>\n'
+                f'群里 @{html.escape(self.username)} 直接提问，需要时可联网搜索。')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'
