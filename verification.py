@@ -3,7 +3,8 @@
 
 状态保存在 verification 表：``state`` 为 ``challenge``（等待作答）或 ``passed``
 （已通过，保留 PASSED_TTL 秒，避免批准入群时再次触发验证）。同一成员只保留一行，
-重复的入群/申请更新沿用同一道题，不会重复发卡片。
+重复的入群/申请更新沿用同一道题，不会重复发卡片。``card`` 是已发出卡片的
+message_id：收尾时按它编辑文案并去掉按钮。
 """
 import json
 import logging
@@ -27,6 +28,14 @@ FINISH_ATTEMPTS = 10
 SETTLED_ERRORS = ('user is deactivated', 'user_id_invalid', 'hide_requester_missing',
                   'user_already_participant', 'participant_id_invalid', 'user_not_participant',
                   'chat not found')
+# 未通过时卡片改成对应文案，不再显示可点击的旧题目。
+CONCLUDED = {'timeout': '⌛ 验证超时，本次入群验证未通过。',
+             'attempts': '❌ 答错次数过多，本次入群验证未通过。',
+             'delivery_failed': '⚠️ 验证卡片发送失败，本次入群验证未通过。',
+             'restrict_failed': '⚠️ 无法限制新成员，本次入群验证未通过。',
+             'unverified': '❌ 本次入群验证未通过。',
+             'cancelled': '❌ 已离开群聊，本次验证作废。',
+             'superseded': '⌛ 已重新发起验证，请使用最新的卡片。'}
 
 
 class Verification:
@@ -47,6 +56,7 @@ class Verification:
           state TEXT NOT NULL DEFAULT 'challenge',
           sent INTEGER NOT NULL DEFAULT 0,
           send_attempts INTEGER NOT NULL DEFAULT 0,
+          card INTEGER NOT NULL DEFAULT 0,
           restored INTEGER NOT NULL DEFAULT 0,
           restore_attempts INTEGER NOT NULL DEFAULT 0,
           approved INTEGER NOT NULL DEFAULT 0,
@@ -59,7 +69,7 @@ class Verification:
 
     REQUIRED_COLUMNS = frozenset({
         'uid', 'chat', 'kind', 'nonce', 'question', 'answer', 'options', 'expires',
-        'attempts', 'state', 'sent', 'send_attempts', 'restored', 'restore_attempts',
+        'attempts', 'state', 'sent', 'send_attempts', 'card', 'restored', 'restore_attempts',
         'approved', 'approve_attempts', 'finish_attempts', 'retry_at', 'updated'})
 
     def require_schema(self):
@@ -91,8 +101,8 @@ class Verification:
         now = int(time.time())
         row = self.db.execute('SELECT * FROM verification WHERE uid=?', (uid,)).fetchone()
         if row and row['state'] == 'passed' and row['expires'] > now:
-            # 已验证过的成员重新申请入群，不再重复验证。
-            if kind == 'request':
+            # 已验证过的成员重新申请入群，不再重复验证；已经批准过的不再重复调接口。
+            if kind == 'request' and not row['approved']:
                 self._approve(row)
             return
         if row and row['state'] == 'challenge' and row['expires'] > now and row['kind'] == kind:
@@ -103,6 +113,10 @@ class Verification:
 
     def forget(self, uid):
         """成员离开群时取消尚未完成的验证；已通过的记录保留到过期。"""
+        if self.db.execute("SELECT 1 FROM verification WHERE uid=? AND state='challenge'",
+                           (uid,)).fetchone():
+            # 人走了，卡片还挂在聊天里：先标失效，别人点了也不会看到旧题目。
+            self._edit_card(uid, CONCLUDED['cancelled'])
         with self.db:
             self.db.execute("DELETE FROM verification WHERE uid=? AND state='challenge'", (uid,))
 
@@ -172,20 +186,20 @@ class Verification:
             self.bot.audit(0, uid, 'verified')
             if outcome:
                 self._answer(query, '验证成功，欢迎入群！')
-                self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+                self._edit_card(uid, '✅ 已通过频道关注与人机验证。')
             else:
                 # 验证已通过，但批准入群暂时失败：不谎报成功，后台继续重试。
                 self._answer(query, '验证已通过，正在为你提交入群申请，请稍候。')
-                self._edit_card(query, '✅ 已通过验证，正在提交入群申请。')
+                self._edit_card(uid, '✅ 已通过验证，正在提交入群申请。')
             return
         self.bot.audit(0, uid, 'verified')
         if self._restore(uid):
             self._answer(query, '验证成功，欢迎入群！')
-            self._edit_card(query, '✅ 已通过频道关注与人机验证。')
+            self._edit_card(uid, '✅ 已通过频道关注与人机验证。')
         else:
             # 验证本身通过，但发言权限没恢复：不谎报“成功”，交给后台重试。
             self._answer(query, '验证已通过，但恢复发言失败；机器人会自动重试，仍无法发言请联系管理员。')
-            self._edit_card(query, '✅ 已通过验证，恢复发言失败，正在自动重试。')
+            self._edit_card(uid, '✅ 已通过验证，恢复发言失败，正在自动重试。')
 
     # --- 后台维护 ---------------------------------------------------------
 
@@ -209,8 +223,8 @@ class Verification:
                 (APPROVE_ATTEMPTS, now)).fetchall():
             self._approve(row)
         for row in self.db.execute(
-                "SELECT uid,restore_attempts FROM verification WHERE state='passed' AND restored=0 "
-                "AND restore_attempts<? AND retry_at<=?",
+                "SELECT uid,restore_attempts FROM verification WHERE state='passed' AND kind='member' "
+                "AND restored=0 AND restore_attempts<? AND retry_at<=?",
                 (RESTORE_ATTEMPTS, now)).fetchall():
             self._restore(row['uid'], row['restore_attempts'])
         with self.db:
@@ -220,6 +234,11 @@ class Verification:
 
     def _create(self, user, kind, chat, now):
         uid = int(user['id'])
+        old = self.db.execute('SELECT card FROM verification WHERE uid=?', (uid,)).fetchone()
+        if old and old['card']:
+            # 旧卡片还留在聊天里（超时后重新申请、或换了入群方式）：先标失效再发新卡片，
+            # 避免两张卡片同时可点、答案互相覆盖。
+            self._edit_card(uid, CONCLUDED['superseded'])
         a, b = secrets.randbelow(8) + 2, secrets.randbelow(8) + 2
         answer = a + b
         options = [answer, answer + 1, answer + 2, answer - 1]
@@ -228,9 +247,9 @@ class Verification:
         with self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO verification(uid,chat,kind,nonce,question,answer,options,expires,"
-                "attempts,state,sent,send_attempts,restored,restore_attempts,approved,approve_attempts,"
+                "attempts,state,sent,send_attempts,card,restored,restore_attempts,approved,approve_attempts,"
                 "finish_attempts,retry_at,updated) "
-                "VALUES(?,?,?,?,?,?,?,?,0,'challenge',0,0,0,0,0,0,0,0,?)",
+                "VALUES(?,?,?,?,?,?,?,?,0,'challenge',0,0,0,0,0,0,0,0,0,?)",
                 (uid, chat, kind, secrets.token_hex(6), f'{a} + {b}', answer,
                  json.dumps(options), now + self.bot.verify_seconds, now))
         row = self.db.execute('SELECT * FROM verification WHERE uid=?', (uid,)).fetchone()
@@ -249,8 +268,8 @@ class Verification:
     def _deliver(self, row):
         uid = row['uid']
         try:
-            # 卡片发出后一直保留在聊天里，结束时只编辑文案，不安排删除。
-            self.bot.send(row['chat'], self._card_text(row), reply_markup=self._keyboard(row))
+            # 卡片发出后一直保留在聊天里，结束时只编辑文案并去掉按钮，不安排删除。
+            sent = self.bot.send(row['chat'], self._card_text(row), reply_markup=self._keyboard(row))
         except APIError as exc:
             attempts = row['send_attempts'] + 1
             LOG.warning('Verification delivery failed uid=%s code=%s attempt=%s', uid, exc.code, attempts)
@@ -261,9 +280,10 @@ class Verification:
                 self.db.execute('UPDATE verification SET send_attempts=?, retry_at=? WHERE uid=?',
                                 (attempts, int(time.time()) + DELIVERY_RETRY_SECONDS, uid))
             return
+        card = int(sent.get('message_id') or 0) if isinstance(sent, dict) else 0
         with self.db:
-            self.db.execute('UPDATE verification SET sent=1, send_attempts=send_attempts+1, retry_at=0 '
-                            'WHERE uid=?', (uid,))
+            self.db.execute('UPDATE verification SET sent=1, send_attempts=send_attempts+1, retry_at=0, '
+                            'card=? WHERE uid=?', (card, uid))
 
     def _fail(self, row, reason):
         """结束一个未通过的验证：拒绝申请或移出成员；失败时标记过期并重试。"""
@@ -272,12 +292,10 @@ class Verification:
             # 先标记失效：即使随后的 Telegram 调用失败，后台也会按超时继续收尾。
             self.db.execute('UPDATE verification SET expires=0, updated=? WHERE uid=?',
                             (int(time.time()), uid))
-        method = 'declineChatJoinRequest' if row['kind'] == 'request' else 'unbanChatMember'
-        payload = {'chat_id': self.bot.group, 'user_id': uid}
-        if method == 'unbanChatMember':
-            payload['only_if_banned'] = False
+        # 先把卡片改成失败文案并去掉按钮，再执行移出/撤销。
+        self._edit_card(uid, CONCLUDED.get(reason, CONCLUDED['unverified']))
         try:
-            self.bot.call(method, **payload)
+            self._conclude(row)
         except APIError as exc:
             if not (exc.permanent and self._settled(exc)):
                 attempts = row['finish_attempts'] + 1
@@ -294,10 +312,33 @@ class Verification:
             self.db.execute('DELETE FROM verification WHERE uid=?', (uid,))
         self.bot.audit(0, uid, f'verification_{reason}')
 
+    def _conclude(self, row):
+        """未通过的收尾：撤销入群申请，或把已进群的成员真正移出。
+
+        ``restrictChatMember`` 只是禁言，单独调 ``unbanChatMember`` 不会把人移出群，
+        因此先 ban 再解封：成员被移出，同时可以重新申请入群。
+        """
+        uid = row['uid']
+        if row['kind'] == 'request':
+            self.bot.call('declineChatJoinRequest', chat_id=self.bot.group, user_id=uid)
+            return
+        self.bot.call('banChatMember', chat_id=self.bot.group, user_id=uid)
+        try:
+            self.bot.call('unbanChatMember', chat_id=self.bot.group, user_id=uid, only_if_banned=True)
+        except APIError as exc:
+            # 解封失败只影响能否立刻重新申请，不影响“已移出”的结论。
+            LOG.warning('Unban after kick failed uid=%s code=%s', uid, exc.code)
+
     def _restore(self, uid, attempts=0):
         try:
             self.bot.restore(uid)
         except APIError as exc:
+            if exc.permanent and self._settled(exc):
+                # 成员已不在群里（退群/已注销）：恢复无意义，按完成处理，不再重试。
+                LOG.info('Restore skipped uid=%s code=%s', uid, exc.code)
+                with self.db:
+                    self.db.execute('UPDATE verification SET restored=1, retry_at=0 WHERE uid=?', (uid,))
+                return True
             attempts += 1
             with self.db:
                 self.db.execute('UPDATE verification SET restore_attempts=?, retry_at=? WHERE uid=?',
@@ -406,12 +447,13 @@ class Verification:
         except APIError as exc:
             LOG.info('Callback acknowledgement failed code=%s', exc.code)
 
-    def _edit_card(self, query, text):
-        message = query.get('message') or {}
-        if not message.get('message_id') or not message.get('chat'):
+    def _edit_card(self, uid, text):
+        """按库里记录的卡片 id 改文案并去掉按钮；卡片已被删除等失败只记日志。"""
+        row = self.db.execute('SELECT chat,card FROM verification WHERE uid=?', (uid,)).fetchone()
+        if not row or not row['card']:
             return
         try:
-            self.bot.call('editMessageText', chat_id=message['chat']['id'],
-                          message_id=message['message_id'], text=text)
+            self.bot.call('editMessageText', chat_id=row['chat'], message_id=row['card'], text=text,
+                          reply_markup={'inline_keyboard': []})
         except APIError as exc:
-            LOG.info('Could not edit completed challenge code=%s', exc.code)
+            LOG.info('Could not edit verification card uid=%s code=%s', uid, exc.code)

@@ -10,6 +10,8 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+# 导入 bot 之前就关掉字节码缓存，否则会在 /opt/tgbot 下留一个 __pycache__。
+sys.dont_write_bytecode = True
 from bot import config
 from botapi import API
 
@@ -53,7 +55,8 @@ def main():
             checked += 1
             if new != old:
                 call('setMyCommands', commands=new, **kwargs)
-                assert call('getMyCommands', **kwargs) == new
+                if call('getMyCommands', **kwargs) != new:
+                    raise RuntimeError(f'setMyCommands readback mismatch scope={scope} lang={language!r}')
                 updated += 1
     print(f'Menu variants checked: {checked}; updated: {updated}')
 

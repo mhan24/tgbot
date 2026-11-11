@@ -10,8 +10,13 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import threading
 import time
+
+# 服务在只读的 /opt 下运行（ProtectSystem=strict），本来就写不了 .pyc；手动跑 --check
+# 或 scripts/update_commands.py 时也不该往源码目录丢 __pycache__。
+sys.dont_write_bytecode = True
 
 from ai import AI, AIError
 from ai import NO_KEY as AI_NO_KEY, USAGE as AI_USAGE
@@ -31,6 +36,9 @@ PERMISSIONS = ('can_send_messages can_send_audios can_send_documents can_send_ph
                'can_send_other_messages can_add_web_page_previews can_react_to_messages '
                'can_edit_tag can_change_info can_invite_users can_pin_messages '
                'can_manage_topics').split()
+# 取不到群默认权限时按“能发言、不能管理”恢复，绝不把成员恢复成全面禁言。
+ADMIN_PERMISSIONS = frozenset(('can_change_info', 'can_invite_users', 'can_pin_messages',
+                               'can_manage_topics'))
 
 
 def config(path='.env'):
@@ -46,6 +54,11 @@ def config(path='.env'):
 
 
 class Bot:
+    PERMISSIONS_TTL = 300   # 群默认权限缓存时长（秒）
+    UPDATE_ATTEMPTS = 5     # 同一条更新最多重试次数，超过即跳过，避免卡住队列
+    TOOL_COOLDOWN = 3       # 同一个人两次 /rate、/bin 的最小间隔（秒）
+    RETRY_AFTER_CAP = 5     # 429 时最多等这么久再重试一次（只等一次，不排长队）
+
     def __init__(self, cfg, api=None, db=None):
         if not cfg.get('CHANNEL_ID'):
             raise RuntimeError('CHANNEL_ID is required (verification channel id)')
@@ -62,10 +75,13 @@ class Bot:
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
         PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS processed(id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,
           target INTEGER,action TEXT,detail TEXT);
+        CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
         ''')
         self.verification = Verification(self)
         self.exchange = Exchange(self.db)
@@ -84,6 +100,10 @@ class Bot:
         # 最近几条文字消息只留在内存里，供 AI 引用目标消息与上文；不写数据库。
         self._recent_lock = threading.Lock()
         self._recent = {}
+        # 以下两项只由主循环使用：坏更新的重试计数、群默认权限的短期缓存。
+        self._update_failures = {}
+        self._chat_permissions = (0.0, None)
+        self._tool_last = {}
         self.username = ''
         self.bot_id = 0
 
@@ -108,6 +128,7 @@ class Bot:
     # --- Telegram 调用与消息生命周期 --------------------------------------
 
     def call(self, method, **kwargs):
+        """所有 Telegram 调用的唯一入口：统一补参、429 重试一次、忽略过期回调。"""
         if method == 'banChatMember':
             kwargs['revoke_messages'] = True
         try:
@@ -118,6 +139,13 @@ class Bot:
                         for term in ('query is too old', 'query id is invalid'))):
                 LOG.info('Callback acknowledgement expired; business state retained')
                 return False
+            if exc.code == 429 and method != 'getUpdates':
+                # 群发几条消息被限流时，等一下重试一次，比直接把消息丢掉好。
+                # getUpdates 的退避由主循环负责，这里不重复等待。
+                wait = min(exc.retry_after, self.RETRY_AFTER_CAP)
+                LOG.warning('Flood control method=%s wait=%ss', method, wait)
+                time.sleep(wait)
+                return self.api.call(method, **kwargs)
             raise
 
     def send(self, chat, text, **kwargs):
@@ -152,6 +180,15 @@ class Bot:
         except APIError as exc:
             LOG.info('Thinking reaction failed code=%s', exc.code)
 
+    def ai_thinking_done(self, chat, message_id):
+        """回答发出后清掉“思考中”的回应；贴纸模式不动，贴纸本来就不该删。"""
+        if self.ai_sticker or not message_id:
+            return
+        try:
+            self.call('setMessageReaction', chat_id=chat, message_id=message_id, reaction=[])
+        except APIError as exc:
+            LOG.info('Clearing thinking reaction failed code=%s', exc.code)
+
     def pending_verification(self):
         """仍有待收尾的验证时缩短长轮询，让超时、批准和恢复重试及时执行。"""
         return bool(self.db.execute(
@@ -180,11 +217,21 @@ class Bot:
                   permissions={key: False for key in PERMISSIONS},
                   use_independent_chat_permissions=True, until_date=until)
 
+    def chat_permissions(self):
+        """群默认权限缓存：管理员调整默认权限后最多 PERMISSIONS_TTL 秒生效。"""
+        stamp, cached = self._chat_permissions
+        if cached is not None and time.time() - stamp < self.PERMISSIONS_TTL:
+            return cached
+        cached = self.call('getChat', chat_id=self.group).get('permissions') or {}
+        self._chat_permissions = (time.time(), cached)
+        return cached
+
     def restore(self, uid):
-        """恢复成员发言权限：按本群默认权限设置。"""
-        permissions = self.call('getChat', chat_id=self.group).get('permissions') or {}
+        """恢复成员发言权限：按本群默认权限设置，缺失的键按发言权限处理。"""
+        permissions = self.chat_permissions()
         self.call('restrictChatMember', chat_id=self.group, user_id=uid,
-                  permissions={key: bool(permissions.get(key, False)) for key in PERMISSIONS},
+                  permissions={key: bool(permissions.get(key, key not in ADMIN_PERMISSIONS))
+                               for key in PERMISSIONS},
                   use_independent_chat_permissions=True)
 
     @staticmethod
@@ -204,12 +251,16 @@ class Bot:
         return f'{name}（@{username}）' if username else name
 
     def remember(self, message):
-        """记住群/私聊里最近的文字消息，供 AI 引用目标消息和上文。"""
+        """记住本群最近的文字消息，供 AI 引用目标消息和上文。
+
+        只有群聊会触发 AI 问答，私聊记录没有用处，不必占用内存。
+        """
         chat = (message.get('chat') or {}).get('id')
         sender = message.get('from') or {}
         text = (message.get('text') or '').strip()
-        if (not chat or not text or text.startswith('/') or message.get('sender_chat')
-                or sender.get('is_bot') or sender.get('id') == self.bot_id):
+        if (not chat or chat != self.group or not text or text.startswith('/')
+                or message.get('sender_chat') or sender.get('is_bot')
+                or sender.get('id') == self.bot_id):
             return
         entry = {'id': int(message.get('message_id') or 0),
                  'author': self.display_name(sender),
@@ -257,9 +308,14 @@ class Bot:
         """getFile 后下载图片字节；失败记日志并返回 None，本次回答降级为纯文字。"""
         try:
             info = self.call('getFile', file_id=file_id)
+            size = int(info.get('file_size') or 0)
+            if size > self.AI_IMAGE_BYTES:
+                # 大小上限同样适用于照片：不在下载后才判超限。
+                LOG.info('AI image too large size=%s', size)
+                return None
             return self.download(info.get('file_path') or '') or None
-        except APIError as exc:
-            LOG.warning('AI image download failed code=%s', exc.code)
+        except (APIError, TypeError, ValueError) as exc:
+            LOG.warning('AI image download failed code=%s', getattr(exc, 'code', 0))
             return None
 
     # --- 更新分发 ---------------------------------------------------------
@@ -318,9 +374,6 @@ class Bot:
 
     def private_message(self, message):
         uid = message['chat']['id']
-        if self.foreign_command(message):
-            # 指向其他机器人的命令不属于本机器人，保持静默。
-            return
         name = self.command_name(message)
         if name == '/start':
             self.send(uid, self.start_text())
@@ -342,7 +395,8 @@ class Bot:
             return
         for user in message.get('new_chat_members') or []:
             self.verification.admit(user, 'member', self.group, sender)
-        if not sender or sender.get('id') == self.bot_id:
+        if not sender or sender.get('is_bot') or sender.get('id') == self.bot_id:
+            # 其他机器人的发言一律不进入业务（Bot API 目前不会转发，这里是兜底）。
             return
         name = self.command_name(message)
         if name == '/help':
@@ -369,15 +423,8 @@ class Bot:
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。')
 
-    def foreign_command(self, message):
-        """``/cmd@其他机器人`` 不是发给本机器人的命令。"""
-        text = (message.get('text') or '').strip()
-        if not text.startswith('/'):
-            return False
-        name = text.split()[0].split('@', 1)
-        return len(name) > 1 and bool(self.username) and name[1].lower() != self.username.lower()
-
     def command_name(self, message):
+        """命令名；``/cmd@其他机器人`` 与普通文字都返回空串（静默忽略）。"""
         text = (message.get('text') or '').strip()
         if not text.startswith('/'):
             return ''
@@ -425,14 +472,16 @@ class Bot:
             offset = int(entity.get('offset') or 0)
             length = int(entity.get('length') or 0)
             kind = entity.get('type')
-            matched = False
             if kind == 'mention':
-                start, end = self._entity_span(text, offset, length)
-                matched = text[start:end].lower() == '@' + self.username.lower()
+                span = self._entity_span(text, offset, length)
+                matched = text[span[0]:span[1]].lower() == '@' + self.username.lower()
             elif kind == 'text_mention':
+                span = self._entity_span(text, offset, length)
                 matched = int((entity.get('user') or {}).get('id') or 0) == self.bot_id
+            else:
+                continue
             if matched:
-                spans.append(self._entity_span(text, offset, length))
+                spans.append(span)
         if not spans:
             return None
         for start, end in sorted(spans, reverse=True):
@@ -441,8 +490,22 @@ class Bot:
 
     # --- 工具查询 ---------------------------------------------------------
 
+    def tool_allowed(self, message):
+        """工具类命令的冷却：防止刷上游配额，也防止主循环被这些请求拖住。"""
+        uid = int((message.get('from') or {}).get('id') or 0)
+        now = time.time()
+        if len(self._tool_last) > 500:
+            self._tool_last = {key: stamp for key, stamp in self._tool_last.items()
+                               if now - stamp < self.TOOL_COOLDOWN}
+        if now - self._tool_last.get(uid, 0) < self.TOOL_COOLDOWN:
+            return False
+        self._tool_last[uid] = now
+        return True
+
     def rate_reply(self, message):
         chat = message['chat']['id']
+        if not self.tool_allowed(message):
+            return
         try:
             text = self.exchange.convert((message.get('text') or '').split()[1:])
         except RateError as exc:
@@ -452,6 +515,8 @@ class Bot:
 
     def bin_reply(self, message):
         chat = message['chat']['id']
+        if not self.tool_allowed(message):
+            return
         try:
             text = self.bin_lookup.query((message.get('text') or '').split()[1:])
         except BinError as exc:
@@ -504,10 +569,12 @@ class Bot:
         message_id = message.get('message_id')
         self.ai_thinking(chat, message_id)
         context = self.ai_context(message)
+        # 提问本身带的图片优先（图片配说明 @机器人），其次才是被引用消息里的图片。
+        image_id = (self.ai_image_id(message)
+                    or self.ai_image_id(message.get('reply_to_message') or {}))
         try:
             threading.Thread(target=self._ai_worker,
-                             args=(chat, question, message_id, context,
-                                   self.ai_image_id(message.get('reply_to_message') or {})),
+                             args=(chat, question, message_id, context, image_id),
                              daemon=True).start()
         except RuntimeError:
             with self._ai_lock:
@@ -530,6 +597,7 @@ class Bot:
                 text = self.AI_FAILED
             self._ai_send(chat, message_id, text)
         finally:
+            self.ai_thinking_done(chat, message_id)
             with self._ai_lock:
                 self._ai_running = max(0, self._ai_running - 1)
 
@@ -560,23 +628,64 @@ class Bot:
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
                 '/bin — 卡 BIN 查询：/bin 45717360\n\n'
                 '<b>AI 问答</b>\n'
-                f'群里 @{html.escape(self.username)} 直接提问，需要时可联网搜索。')
+                f'群里 @{html.escape(self.username)} 直接提问（可附图或引用图片），需要时可联网搜索。')
 
     def start_text(self):
         return (f'👋 你好，这是为群 {html.escape(self.group_label)} 提供服务的机器人。\n'
                 '入群申请会先私聊发送验证题：请先关注关联频道，再点击正确答案。\n'
                 '发送 /help 查看完整说明。')
 
+    def dispatch(self, update):
+        """处理一条更新：永久失败直接跳过，意外异常重试有限次后也跳过。
+
+        ``offset`` 只在处理结束后前移，一条反复抛异常的更新会把整个队列卡住，
+        因此异常计数到 UPDATE_ATTEMPTS 后放弃该更新并写审计。
+        """
+        update_id = update['update_id']
+        try:
+            self.handle(update)
+        except APIError as exc:
+            if exc.permanent:
+                # 过期申请、失效回调不能让后续更新全部卡住。
+                LOG.error('Permanent failure update=%s code=%s', update_id, exc.code)
+                self.audit(0, 0, 'update_failed', f'{update_id}: {exc.code}')
+            elif self._may_retry(update_id):
+                raise
+            else:
+                self._update_failures.pop(update_id, None)
+                LOG.error('Giving up update=%s code=%s', update_id, exc.code)
+                self.audit(0, 0, 'update_abandoned', f'{update_id}: {exc.code}')
+        except Exception:
+            if self._may_retry(update_id):
+                raise
+            self._update_failures.pop(update_id, None)
+            LOG.exception('Giving up update=%s after repeated failures', update_id)
+            self.audit(0, 0, 'update_abandoned', str(update_id))
+        else:
+            self._update_failures.pop(update_id, None)
+
+    def _may_retry(self, update_id):
+        """记一次失败并返回是否还值得重试。"""
+        if len(self._update_failures) > 100:
+            self._update_failures.clear()
+        attempts = self._update_failures.get(update_id, 0) + 1
+        self._update_failures[update_id] = attempts
+        return attempts < self.UPDATE_ATTEMPTS
+
     # --- 主循环 -----------------------------------------------------------
 
     # 每个后台任务的最短间隔；失败后统一冷却 30 秒起。
-    MAINTENANCE_TASKS = (('verification', 0), ('processed', 600))
+    MAINTENANCE_TASKS = (('verification', 0), ('processed', 600), ('audit', 3600),
+                         ('bin_cache', 86400))
     PROCESSED_LIMIT = 5000
+    AUDIT_DAYS = 30
 
     def maintenance(self):
         next_run = getattr(self, '_next_run', {})
         actions = {'verification': self.verification.tick,
-                   'processed': self.prune_processed}
+                   'processed': self.prune_processed,
+                   'audit': self.prune_audit,
+                   'bin_cache': self.bin_lookup.prune}
         now = time.time()
         for name, interval in self.MAINTENANCE_TASKS:
             if next_run.get(name, 0) > now:
@@ -595,6 +704,12 @@ class Bot:
         with self.db:
             self.db.execute('DELETE FROM processed WHERE id <= (SELECT max(id) - ? FROM processed)',
                             (self.PROCESSED_LIMIT,))
+
+    def prune_audit(self):
+        """审计只保留最近 AUDIT_DAYS 天，否则长期运行会一直长。"""
+        with self.db:
+            self.db.execute('DELETE FROM audit WHERE at < ?',
+                            (int(time.time()) - self.AUDIT_DAYS * 86400,))
 
     def validate_permissions(self):
         channel_member = self.call('getChatMember', chat_id=self.channel, user_id=self.bot_id)
@@ -619,7 +734,11 @@ class Bot:
         start_time = int(self.db.execute("SELECT value FROM meta WHERE key='start_time'").fetchone()[0])
         row = self.db.execute("SELECT value FROM meta WHERE key='offset'").fetchone()
         offset = int(row[0]) if row else 0
-        LOG.info('Started @%s group=%s', self.username, self.group)
+        # 启动时把生效配置打进日志（不含任何密钥），方便排查“为什么没联网/没回答”。
+        LOG.info('Started @%s group=%s channel=%s verify=%ss ai=%s/%s search=%s',
+                 self.username, self.group, self.channel, self.verify_seconds,
+                 'on' if self.ai.enabled else 'off', self.ai.model,
+                 'exa' if self.ai.search_enabled else 'off')
         while True:
             try:
                 self.maintenance()
@@ -628,36 +747,54 @@ class Bot:
                                     allowed_updates=['message', 'chat_member', 'chat_join_request',
                                                      'callback_query'])
                 for update in updates:
+                    update_id = update['update_id']
                     payload = next((update[key] for key in ('message', 'chat_member', 'chat_join_request')
                                     if key in update), {})
                     event_time = payload.get('date', start_time)
                     if (self.accepts_update(update) and event_time >= start_time and
                             not self.db.execute('SELECT 1 FROM processed WHERE id=?',
-                                                (update['update_id'],)).fetchone()):
-                        try:
-                            self.handle(update)
-                        except APIError as exc:
-                            if not exc.permanent:
-                                raise
-                            # 过期申请、失效回调不能让后续更新全部卡住。
-                            LOG.error('Permanent failure update=%s code=%s', update['update_id'], exc.code)
-                            self.audit(0, 0, 'update_failed', f'{update["update_id"]}: {exc.code}')
-                    offset = update['update_id'] + 1
+                                                (update_id,)).fetchone()):
+                        self.dispatch(update)
+                    offset = update_id + 1
                     with self.db:
-                        self.db.execute('INSERT OR IGNORE INTO processed VALUES(?)', (update['update_id'],))
+                        self.db.execute('INSERT OR IGNORE INTO processed VALUES(?)', (update_id,))
                         self.db.execute("INSERT OR REPLACE INTO meta VALUES('offset',?)", (str(offset),))
             except APIError as exc:
                 if exc.code == 409:
                     # 同一个 token 被两个进程轮询时 Telegram 返回 409。
                     LOG.error('Polling conflict: another instance is polling this token')
                 else:
-                    LOG.warning('Polling failed code=%s retry_after=%s', exc.code, exc.retry_after)
+                    LOG.warning('Polling failed method=%s code=%s retry_after=%s',
+                                exc.method, exc.code, exc.retry_after)
                 time.sleep(min(max(exc.retry_after, 3), 60))
             except Exception:
                 LOG.exception('Update failed; will retry')
                 time.sleep(5)
 
 
+def check(bot, out=print):
+    """``--check``：只校验 token、webhook 与管理员权限，然后退出，不进入长轮询。
+
+    部署或改完 .env 后先跑一次，比起直接启服务再看日志更快也更安全。
+    """
+    try:
+        me = bot.call('getMe')
+        bot.username, bot.bot_id = me['username'], me['id']
+        webhook = bot.call('getWebhookInfo').get('url') or '-'
+        bot.validate_permissions()
+    except (APIError, RuntimeError) as exc:
+        raise SystemExit(f'check failed: {exc}') from None
+    out(f'ok @{bot.username} group={bot.group} channel={bot.channel} '
+        f'verify={bot.verify_seconds}s ai={"on" if bot.ai.enabled else "off"}/'
+        f'{bot.ai.model} search={"exa" if bot.ai.search_enabled else "off"} '
+        f'webhook={webhook}')
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    Bot(config()).run()
+    # .env 跟着脚本走，这样 --check 在任意目录下都能跑。
+    bot = Bot(config(str(Path(__file__).resolve().with_name('.env'))))
+    if '--check' in sys.argv[1:]:
+        check(bot)
+    else:
+        bot.run()

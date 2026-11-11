@@ -5,23 +5,24 @@
 金额最多 15 位整数、8 位小数，不接受负数与科学计数；币种按接口返回列表校验，
 USDT 不自动当作 USD。接口失败时不使用过期缓存，也不伪造结果。
 """
+import html
 import json
 import re
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
+import httpjson
+
 CST = timezone(timedelta(hours=8))
 CACHE_SECONDS = 3600
+FAIL_COOLDOWN = 30  # 上游刚失败过就先冷却，别让每条 /rate 都去撞一个已经挂掉的服务
 API_URL = 'https://api.exchangerate.fun/latest'
-TIMEOUT = 10
-# 上游拦截默认的 Python-urllib UA（403），请求必须携带自定义 UA。
-USER_AGENT = 'tgbot/1.0'
+TIMEOUT = 6  # 上游正常在一秒内返回；超时就尽快放弃，别让主循环陪它等
 
 AMOUNT = re.compile(r'\d{1,15}(\.\d{1,8})?')
+SEPARATORS = str.maketrans('', '', ',_\u3000 ')
 USAGE = '用法：/rate 100 USD CNY，或 /rate USD CNY。'
 UNAVAILABLE = '汇率服务暂时不可用，请稍后重试。'
 
@@ -31,15 +32,11 @@ class RateError(Exception):
 
 
 def _fetch(base, timeout):
-    request = urllib.request.Request(f'{API_URL}?base={base}',
-                                     headers={'Accept': 'application/json',
-                                              'User-Agent': USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
-    except (OSError, urllib.error.URLError, ValueError):
+        payload = httpjson.get(f'{API_URL}?base={base}', timeout=timeout)
+    except (httpjson.HTTPStatus, OSError, ValueError):
         raise RateError(UNAVAILABLE) from None
-    rates = payload.get('rates') if isinstance(payload, dict) else None
+    rates = payload.get('rates')
     if not isinstance(rates, dict) or not rates:
         raise RateError(UNAVAILABLE)
     try:
@@ -61,6 +58,7 @@ class Exchange:
     def __init__(self, db, timeout=TIMEOUT):
         self.db = db
         self.timeout = timeout
+        self._failed_until = 0.0
         db.row_factory = db.row_factory or sqlite3.Row
         db.executescript('''
         CREATE TABLE IF NOT EXISTS rates(
@@ -72,7 +70,13 @@ class Exchange:
                               ('USD',)).fetchone()
         if row and int(time.time()) - row['fetched'] < CACHE_SECONDS:
             return json.loads(row['payload']), row['stamp']
-        rates, stamp = _fetch('USD', self.timeout)
+        if time.time() < self._failed_until:
+            raise RateError(UNAVAILABLE)
+        try:
+            rates, stamp = _fetch('USD', self.timeout)
+        except RateError:
+            self._failed_until = time.time() + FAIL_COOLDOWN
+            raise
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO rates(base,stamp,fetched,payload) VALUES(?,?,?,?)',
                             ('USD', stamp, int(time.time()), json.dumps(rates)))
@@ -87,6 +91,8 @@ class Exchange:
             amount_text, source, target = args
         else:
             raise RateError(USAGE)
+        # 允许千分位与空格：/rate 1,000 USD CNY。
+        amount_text = amount_text.translate(SEPARATORS)
         if not AMOUNT.fullmatch(amount_text):
             raise RateError('金额格式不正确：最多 15 位整数、8 位小数，不接受负数与科学计数。')
         try:
@@ -96,7 +102,8 @@ class Exchange:
         rates, stamp = self._usd_rates()
         for code in (source, target):
             if code not in rates:
-                raise RateError(f'暂不支持币种 {code}，例如 /rate USD CNY。')
+                # 回复按 HTML 发送：用户输入的币种码必须先转义。
+                raise RateError(f'暂不支持币种 {html.escape(code)}，例如 /rate USD CNY。')
         unit = Decimal(str(rates[target])) / Decimal(str(rates[source]))
         result = amount * unit
         when = datetime.fromtimestamp(stamp or time.time(), CST).strftime('%Y-%m-%d %H:%M')

@@ -11,17 +11,16 @@ import json
 import re
 import sqlite3
 import time
-import urllib.error
-import urllib.request
+
+import httpjson
 
 CACHE_SECONDS = 86400
 API_URL = 'https://lookup.binlist.net/'
-TIMEOUT = 10
-# 与 exchange.py 保持一致：请求携带自定义 UA，避免被上游按默认库 UA 拦截。
-USER_AGENT = 'tgbot/1.0'
+TIMEOUT = 6  # 上游正常在一秒内返回；超时就尽快放弃，别让主循环陪它等
 USAGE = '用法：/bin 45717360（6–8 位数字）。'
 UNAVAILABLE = 'BIN 查询服务暂时不可用，请稍后重试。'
 PAYLOAD_VERSION = 2
+FAIL_COOLDOWN = 30  # 失败或限流后的冷却，别让每条 /bin 都去撞同一堵墙
 
 FUNDING = {'credit': '贷记', 'debit': '借记', 'charge': '签账', 'prepaid': '预付'}
 LEVELS = re.compile(r'BUSINESS|CORPORATE|PLATINUM|GOLD|CLASSIC|SIGNATURE'
@@ -40,6 +39,7 @@ class BinLookup:
     def __init__(self, db, timeout=TIMEOUT):
         self.db = db
         self.timeout = timeout
+        self._failed_until = 0.0
         db.row_factory = db.row_factory or sqlite3.Row
         db.executescript('''
         CREATE TABLE IF NOT EXISTS bin_cache(
@@ -48,34 +48,39 @@ class BinLookup:
 
     def query(self, args):
         """处理 /bin 参数并返回回复文本；用户可见的失败抛 BinError。"""
-        if len(args) != 1:
-            raise BinError(USAGE)
-        bin_number = re.sub(r'\D', '', args[0])
+        # 允许分组书写：/bin 4571 7380 与 /bin 4571-7380 都是 45717380。
+        bin_number = re.sub(r'\D', '', ' '.join(args))
         if not 6 <= len(bin_number) <= 8:
             raise BinError(USAGE)
-        row = self.db.execute('SELECT payload FROM bin_cache WHERE bin=?',
+        row = self.db.execute('SELECT fetched,payload FROM bin_cache WHERE bin=?',
                               (bin_number,)).fetchone()
-        if row:
+        if row and int(time.time()) - int(row['fetched'] or 0) < CACHE_SECONDS:
             try:
                 payload = json.loads(row['payload'])
             except ValueError:
                 payload = None
             if isinstance(payload, dict) and payload.get('v') == PAYLOAD_VERSION:
                 return self._format(payload, bin_number)
+        if row:
+            # 过期的或旧版本式样的缓存行直接删掉，下一步重新请求。
             with self.db:
                 self.db.execute('DELETE FROM bin_cache WHERE bin=?', (bin_number,))
-        request = urllib.request.Request(API_URL + bin_number, headers={
-            'Accept': 'application/json', 'Accept-Version': '3', 'User-Agent': USER_AGENT})
+        if time.time() < self._failed_until:
+            raise BinError(UNAVAILABLE)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
+            data = httpjson.get(API_URL + bin_number, headers={'Accept-Version': '3'},
+                                timeout=self.timeout)
+        except httpjson.HTTPStatus as exc:
             if exc.code == 404:
+                # 未收录是这只 BIN 的事，不影响其他查询，也不该让全局进入冷却。
                 raise BinError(f'BIN {bin_number} 未收录，请确认号码后重试。') from None
             if exc.code == 429:
+                self._failed_until = time.time() + FAIL_COOLDOWN
                 raise BinError('BIN 查询上游限流，请稍后再试。') from None
+            self._failed_until = time.time() + FAIL_COOLDOWN
             raise BinError(UNAVAILABLE) from None
-        except (OSError, urllib.error.URLError, ValueError):
+        except (OSError, ValueError):
+            self._failed_until = time.time() + FAIL_COOLDOWN
             raise BinError(UNAVAILABLE) from None
         # binlist 对未收录的 BIN 返回 200 空数据而非 404：按未收录提示。
         if not isinstance(data, dict) or not data.get('scheme'):
@@ -85,6 +90,12 @@ class BinLookup:
             self.db.execute('INSERT OR REPLACE INTO bin_cache(bin,fetched,payload) VALUES(?,?,?)',
                             (bin_number, int(time.time()), json.dumps(payload)))
         return self._format(payload, bin_number)
+
+    def prune(self, max_age=CACHE_SECONDS * 7):
+        """清掉长期没再被查询的缓存行，BIN 空间很大时表不会无限增长。"""
+        with self.db:
+            self.db.execute('DELETE FROM bin_cache WHERE fetched < ?',
+                            (int(time.time()) - max_age,))
 
     @staticmethod
     def _normalize(data):

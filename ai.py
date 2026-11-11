@@ -15,8 +15,8 @@ import json
 import logging
 import re
 import time
-import urllib.error
-import urllib.request
+
+import httpjson
 
 LOG = logging.getLogger('groupbot.ai')
 
@@ -33,9 +33,9 @@ SEARCH_RESULTS = 3
 SEARCH_SNIPPET = 500
 SEARCH_THRESHOLD = 0.5
 PROBE_CHARS = 600  # 交给联网判定与检索的问题文本上限：问题在前，其后拼引用与聊天记录
+MAX_ELAPSED = 100  # 一次问答的总耗时上限（秒）：用完就不再联网重试，先把已有结果给出去
 RETRY_DELAY = 1.5  # 网关超时、5xx 或 429 后的重试延时（秒），对齐 ai.ts 的固定延时重试
-# 与 exchange.py 一致：网关会拦截默认的 Python-urllib UA，请求必须带自定义 UA。
-USER_AGENT = 'tgbot/1.0'
+AUX_TIMEOUT = 20  # 联网判定与搜索的单独超时：它们只是辅助，挂住不该让人等满 AI_TIMEOUT
 
 USAGE = '用法：@机器人 你的问题，例如 @机器人 SQLite 的 WAL 模式有什么代价？'
 NO_KEY = 'AI 问答未配置：请在 .env 设置 AI_API_KEY 后重启服务。'
@@ -105,6 +105,8 @@ class AI:
             raise AIError(USAGE)
         if len(question) > MAX_QUESTION:
             raise AIError(f'问题太长：请控制在 {MAX_QUESTION} 字以内。')
+        # 判定、检索、重试共享一个总预算：任何一环都别把用户拖到两分钟以上。
+        deadline = time.time() + MAX_ELAPSED
         messages = [{'role': 'system', 'content': self.system}]
         search_failed = False
         # 联网状态原样写进回复：off 未启用搜索，skipped 判定不需要，used n 条结果。
@@ -118,7 +120,7 @@ class AI:
         if self.search_enabled:
             # Jev 只负责判断是否联网：未启用搜索时不用判定，页脚直接显示“未启用搜索”。
             if self.typesafe_key:
-                verdicts, judge_state = self._judge(probe)
+                verdicts, judge_state = self._judge(probe, deadline)
                 if judge_state == 'ok':
                     need_search, need_p = verdicts['needs_web_search']
                     judge_text = (f'🧠 {html.escape(self.typesafe_model)} '
@@ -127,10 +129,9 @@ class AI:
                     judge_text = f'🧠 {html.escape(self.typesafe_model)} 判定失败，默认联网'
             else:
                 judge_text = '🧠 未配置判定模型，默认联网'
-        if self.search_enabled:
             search_state = 'skipped'
             if need_search is not False:
-                results, ok = self._search(probe)
+                results, ok = self._search(probe, deadline)
                 if ok:
                     search_state = 'used' if results else 'empty'
                     search_count = len(results)
@@ -153,25 +154,28 @@ class AI:
         else:
             messages.append({'role': 'user', 'content': question})
         try:
-            answer, model = self._answer(messages)
+            answer, model = self._answer(messages, deadline)
         except AIError as exc:
             # 网关/模型按 4xx 拒绝图片输入时降级为纯文字回答，不再当作故障。
             if not image_part or exc.code not in (400, 404, 422):
                 raise
             LOG.warning('Model rejected image input code=%s; falling back to text-only', exc.code)
             messages[-1] = {'role': 'user', 'content': question}
-            answer, model = self._answer(messages)
+            answer, model = self._answer(messages, deadline)
             answer += '\n\n⚠️ 附图未被模型识别，本次仅按文字回答。'
         if image and image_part is None:
             answer += '\n\n⚠️ 附图为不支持的格式，本次仅按文字回答。'
-        text = html.escape(self._strip_markdown(answer))
+        text = self._strip_markdown(answer)
         if search_failed:
             text += '\n\n⚠️ ' + SEARCH_FAILED
+        # 先按纯文本切分再转义：在已转义的文本里切分会把 &amp; 这类实体拦腰截断，
+        # 发给 Telegram 时会直接报解析错误、整条回答丢掉。
         parts = self._split(text)
         if len(parts) > 1:
             total = len(parts) - 1
             parts = [part if index == 0 else f'📋 续（{index}/{total}）：\n{part}'
                      for index, part in enumerate(parts)]
+        parts = [html.escape(part) for part in parts]
         parts[-1] += '\n\n' + self._footer(model, search_state, search_count, judge_text)
         return parts
 
@@ -193,7 +197,7 @@ class AI:
         return {'type': 'image_url',
                 'image_url': {'url': 'data:%s;base64,' % mime + base64.b64encode(data).decode()}}
 
-    def _judge(self, probe):
+    def _judge(self, probe, deadline=None):
         """一次 TypeSafe 调用判定“是否需要联网”。
 
         返回 ({'needs_web_search': (结论, 概率)}, 状态)；状态 ok / failed / off。
@@ -207,7 +211,8 @@ class AI:
                                                    'criteria': SEARCH_CRITERIA}}}
         try:
             payload = self._post(TYPESAFE_URL, body,
-                                 {'Authorization': 'Bearer ' + self.typesafe_key})
+                                 {'Authorization': 'Bearer ' + self.typesafe_key},
+                                 timeout=self._timeout(min(self.timeout, AUX_TIMEOUT), deadline))
         except AIError as exc:
             LOG.warning('TypeSafe judgment failed code=%s', exc.code)
             return {}, 'failed'
@@ -224,14 +229,14 @@ class AI:
 
     # --- 生成回答 ---------------------------------------------------------
 
-    def _answer(self, messages):
-        data = self._chat(messages)
+    def _answer(self, messages, deadline=None):
+        data = self._chat(messages, deadline)
         answer = self._content(data)
         if not answer:
             # 网关偶尔只返回推理过程、没有正文：补一次收尾请求，仍为空才报错。
             LOG.info('Empty answer from model; asking for a final reply once')
             data = self._chat(messages + [{
-                'role': 'user', 'content': '请直接给出最终回答，不要输出推理过程。'}])
+                'role': 'user', 'content': '请直接给出最终回答，不要输出推理过程。'}], deadline)
             answer = self._content(data)
         if not answer:
             raise AIError(EMPTY)
@@ -243,15 +248,18 @@ class AI:
                  else SEARCH_LABELS.get(search_state, '未联网'))
         return ' · '.join(p for p in (f'🤖 {html.escape(model)}', judge_text, f'🔎 {label}') if p)
 
-    def _chat(self, messages):
+    def _chat(self, messages, deadline=None):
         body = {'model': self.model, 'messages': messages, 'max_tokens': MAX_TOKENS}
         headers = {'Authorization': 'Bearer ' + self.api_key}
         # 网关偶发挂起节点会直接超时：超时、5xx 或 429 时延时重试一次，命中正常节点即可作答。
+        # 总预算用完后不再重试，直接把第一次的失败告诉用户。
         for attempt in (1, 2):
             try:
-                return self._post(self.api_base + '/chat/completions', body, headers)
+                return self._post(self.api_base + '/chat/completions', body, headers,
+                                  timeout=self._timeout(self.timeout, deadline))
             except AIError as exc:
-                if attempt == 1 and (exc.code == 0 or exc.code == 429 or exc.code >= 500):
+                if (attempt == 1 and (exc.code == 0 or exc.code == 429 or exc.code >= 500)
+                        and (deadline is None or time.time() < deadline)):
                     LOG.warning('Chat request failed code=%s; retrying after delay', exc.code)
                     time.sleep(RETRY_DELAY)
                     continue
@@ -265,12 +273,13 @@ class AI:
 
     # --- 联网搜索 ---------------------------------------------------------
 
-    def _search(self, query):
+    def _search(self, query, deadline=None):
         """返回 (结果列表, 是否成功)；搜索失败不阻断回答。"""
         body = {'query': query, 'numResults': SEARCH_RESULTS,
                 'contents': {'text': {'maxCharacters': SEARCH_SNIPPET}}}
         try:
-            payload = self._post(EXA_URL, body, {'x-api-key': self.exa_key})
+            payload = self._post(EXA_URL, body, {'x-api-key': self.exa_key},
+                                 timeout=self._timeout(min(self.timeout, AUX_TIMEOUT), deadline))
         except AIError as exc:
             LOG.warning('Search failed code=%s', exc.code)
             return [], False
@@ -290,31 +299,25 @@ class AI:
 
     # --- 传输 -------------------------------------------------------------
 
-    def _post(self, url, body, headers):
-        request = urllib.request.Request(
-            url, data=json.dumps(body).encode(),
-            headers={'Content-Type': 'application/json', 'Accept': 'application/json',
-                     'User-Agent': USER_AGENT, **headers})
+    @staticmethod
+    def _timeout(cap, deadline=None):
+        """单次调用的超时：不超过 ``cap``，也不超过总预算的剩余时间（至少留 5 秒）。"""
+        if deadline is None:
+            return cap
+        return max(5, min(cap, deadline - time.time()))
+
+    def _post(self, url, body, headers, timeout=None):
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = json.load(response)
-        except urllib.error.HTTPError as exc:
+            return httpjson.post(url, body, headers,
+                                 timeout=self.timeout if timeout is None else timeout)
+        except httpjson.HTTPStatus as exc:
             raise self._http_error(exc) from None
-        except (OSError, urllib.error.URLError):
+        except (OSError, ValueError):
             raise AIError(UNAVAILABLE) from None
-        except (ValueError, UnicodeError):
-            raise AIError(UNAVAILABLE) from None
-        if not isinstance(payload, dict):
-            raise AIError(UNAVAILABLE)
-        return payload
 
     @staticmethod
     def _http_error(exc):
-        try:
-            detail = exc.read().decode('utf-8', 'replace')[:300]
-        except Exception:
-            detail = ''
-        code = exc.code
+        code, detail = exc.code, exc.detail
         if code in (401, 403):
             return AIError('AI 服务拒绝了凭据：请检查 .env 的 AI_API_KEY / EXA_API_KEY。', code, detail)
         if code == 429:
@@ -328,20 +331,36 @@ class AI:
         return MARKDOWN.sub('', text).strip()
 
     @staticmethod
-    def _split(text, limit=MAX_ANSWER):
-        """按行把长回答拆成多条消息，超长单行硬切；不再整体截断丢内容。"""
-        if len(text) <= limit:
+    def _split(text, limit=MAX_ANSWER, encode=html.escape):
+        """按行把长回答拆成多条消息，超长单行硬切；不再整体截断丢内容。
+
+        长度按 ``encode``（发送时的转义）后的文本计算，但切点总落在未转义的
+        纯文本上：先切再转义，不会把 ``&amp;`` 这类实体拦腰截断。
+        """
+        if len(encode(text)) <= limit:
             return [text]
         parts, current = [], ''
-        for line in text.split('\n'):
-            while len(line) > limit:
-                parts.append(line[:limit])
-                line = line[limit:]
-            if current and len(current) + len(line) + 1 > limit:
-                parts.append(current)
-                current = line
+        for raw in text.split('\n'):
+            pieces = []
+            if len(encode(raw)) <= limit:
+                pieces = [raw]
             else:
-                current = f'{current}\n{line}' if current else line
+                rest = raw
+                while rest:
+                    size = min(len(rest), limit)
+                    while size > 1 and len(encode(rest[:size])) > limit:
+                        size = size * 3 // 4
+                    pieces.append(rest[:size])
+                    rest = rest[size:]
+                if not pieces:
+                    pieces = ['']
+            for line in pieces:
+                candidate = f'{current}\n{line}' if current else line
+                if current and len(encode(candidate)) > limit:
+                    parts.append(current)
+                    current = line
+                else:
+                    current = candidate
         if current:
             parts.append(current)
         return parts
