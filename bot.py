@@ -69,12 +69,13 @@ class Bot:
         ''')
         self.verification = Verification(self)
         self.exchange = Exchange(self.db)
-        self.bin_lookup = BinLookup(self.db, api_key=cfg.get('BIN_API_KEY', ''))
+        self.bin_lookup = BinLookup(self.db)
         self.ai = AI(api_base=cfg.get('AI_API_BASE', ''), api_key=cfg.get('AI_API_KEY', ''),
                      model=cfg.get('AI_MODEL', ''), exa_key=cfg.get('EXA_API_KEY', ''),
                      timeout=self._bounded(cfg.get('AI_TIMEOUT'), 60, 10, 180),
                      typesafe_key=cfg.get('TYPESAFE_API_KEY', ''),
-                     typesafe_model=cfg.get('TYPESAFE_MODEL', ''))
+                     typesafe_model=cfg.get('TYPESAFE_MODEL', ''),
+                     system=cfg.get('AI_PROMPT', ''))
         self.ai_sticker = (cfg.get('AI_THINKING_STICKER') or '').strip()
         # 问答在后台线程执行，这里只保存并发与冷却状态，不访问数据库。
         self._ai_lock = threading.Lock()
@@ -130,6 +131,10 @@ class Bot:
             payload['reply_to_message_id'] = reply_to
             payload['allow_sending_without_reply'] = True
         return self.call('sendSticker', **payload)
+
+    def download(self, file_path):
+        """下载 Telegram 文件内容（/ai 图片识别用）；失败抛 APIError，由调用方降级。"""
+        return self.api.download(file_path)
 
     def ai_thinking(self, chat, message_id):
         """在提问上标记“正在回答”：优先贴纸，未配置或失败时用表情回应。"""
@@ -217,19 +222,45 @@ class Bot:
             del items[:-self.AI_HISTORY * 2]
 
     def ai_context(self, message):
-        """被回复的目标消息 + 它之前的几条消息；没有引用时只取提问前的上文。"""
+        """被回复的目标消息 + 提问前后的最近发言；没有引用时只取提问前的发言。"""
         chat = message['chat']['id']
         quoted = message.get('reply_to_message') or {}
         anchor = int(quoted.get('message_id') or message.get('message_id') or 0)
         with self._recent_lock:
-            items = [item for item in self._recent.get(chat, ()) if item['id'] < anchor]
+            items = [item for item in self._recent.get(chat, ()) if item['id'] != anchor]
         lines = []
-        quoted_text = (quoted.get('text') or '').strip()
-        if quoted_text:
+        quoted_text = (quoted.get('text') or quoted.get('caption') or '').strip()
+        if self.ai_image_id(quoted):
+            head = f'[引用] {self.display_name(quoted.get("from") or {})}：（图片）'
+            lines.append(head + (' ' + quoted_text[:self.AI_CONTEXT_CHARS] if quoted_text else ''))
+        elif quoted_text:
             lines.append(f'[引用] {self.display_name(quoted.get("from") or {})}：'
                          f'{quoted_text[:self.AI_CONTEXT_CHARS]}')
-        lines.extend(f'[上文] {item["author"]}：{item["text"]}' for item in items[-self.AI_HISTORY:])
+        lines.extend(f'[聊天] {item["author"]}：{item["text"]}' for item in items[-self.AI_HISTORY:])
         return lines
+
+    def ai_image_id(self, quoted):
+        """被引用消息里的图片 file_id：照片取最大尺寸，图片文件限 AI_IMAGE_BYTES；没有返回空。"""
+        photo = quoted.get('photo')
+        if photo:
+            return (photo[-1] or {}).get('file_id') or ''
+        doc = quoted.get('document') or {}
+        try:
+            size = int(doc.get('file_size') or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if str(doc.get('mime_type') or '').startswith('image/') and 0 < size <= self.AI_IMAGE_BYTES:
+            return doc.get('file_id') or ''
+        return ''
+
+    def ai_image_bytes(self, file_id):
+        """getFile 后下载图片字节；失败记日志并返回 None，本次回答降级为纯文字。"""
+        try:
+            info = self.call('getFile', file_id=file_id)
+            return self.download(info.get('file_path') or '') or None
+        except APIError as exc:
+            LOG.warning('AI image download failed code=%s', exc.code)
+            return None
 
     # --- 更新分发 ---------------------------------------------------------
 
@@ -379,8 +410,9 @@ class Bot:
     AI_CONCURRENCY = 2      # 同时生成中的回答
     AI_PENDING = 6          # 进行中 + 排队上限，超出直接提示稍后再试
     AI_COOLDOWN = 15        # 同一用户两次提问的最小间隔（秒）
-    AI_HISTORY = 5          # /ai 引用的上文条数
+    AI_HISTORY = 5          # /ai 引用的聊天记录条数
     AI_CONTEXT_CHARS = 500  # 单条上下文截断长度
+    AI_IMAGE_BYTES = 5 * 1024 * 1024  # 被引用图片文件的大小上限，超出不识别
     AI_THINKING_REACTION = '🤔'   # 思考中的表情回应；配置了 AI_THINKING_STICKER 时改用贴纸
     AI_FAILED = '⚠️ AI 问答失败，请稍后重试。'
 
@@ -417,18 +449,23 @@ class Bot:
         self.ai_thinking(chat, message_id)
         context = self.ai_context(message)
         try:
-            threading.Thread(target=self._ai_worker, args=(chat, question, message_id, context),
+            threading.Thread(target=self._ai_worker,
+                             args=(chat, question, message_id, context,
+                                   self.ai_image_id(message.get('reply_to_message') or {})),
                              daemon=True).start()
         except RuntimeError:
             with self._ai_lock:
                 self._ai_running = max(0, self._ai_running - 1)
             self._ai_send(chat, message_id, self.AI_FAILED)
 
-    def _ai_worker(self, chat, question, message_id, context=None):
+    def _ai_worker(self, chat, question, message_id, context=None, image_id=''):
         """后台线程：只发起 HTTP 调用，不碰主循环使用的 SQLite 连接。"""
         try:
             try:
-                text = self.ai.ask(question, context=context)
+                image = self.ai_image_bytes(image_id) if image_id else None
+                if image_id and image is None and context is not None:
+                    context.append('[系统提示] 图片下载失败，本次回答看不到图片内容。')
+                text = self.ai.ask(question, context=context, image=image)
             except AIError as exc:
                 LOG.warning('AI answer failed code=%s', getattr(exc, 'code', 0))
                 text = f'⚠️ {exc}'
@@ -441,14 +478,15 @@ class Bot:
                 self._ai_running = max(0, self._ai_running - 1)
 
     def _ai_send(self, chat, message_id, text):
-        """回答作为引用提问的回复发出；提问已被删除时照常发送，消息一律保留。"""
+        """回答作为引用提问的回复发出；长回答拆成多条，消息一律保留。"""
         payload = {}
         if message_id:
             payload = {'reply_to_message_id': message_id, 'allow_sending_without_reply': True}
-        try:
-            self.send(chat, text, **payload)
-        except APIError as exc:
-            LOG.warning('AI answer delivery failed code=%s', exc.code)
+        for part in (text if isinstance(text, list) else [text]):
+            try:
+                self.send(chat, part, **payload)
+            except APIError as exc:
+                LOG.warning('AI answer delivery failed code=%s', exc.code)
 
     # --- 说明文案 ---------------------------------------------------------
 

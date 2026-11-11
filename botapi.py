@@ -29,6 +29,7 @@ class APIError(Exception):
 class API:
     def __init__(self, token, timeout=DEFAULT_TIMEOUT):
         self.base = 'https://api.telegram.org/bot' + token + '/'
+        self.file_base = 'https://api.telegram.org/file/bot' + token + '/'
         self.timeout = timeout
 
     def call(self, method, **data):
@@ -55,3 +56,15 @@ class API:
         if 'result' not in payload:
             raise APIError(method, {'error_code': 503, 'description': 'Missing API result'})
         return payload['result']
+
+    def download(self, file_path):
+        """下载 getFile 给出的文件路径，返回 bytes；失败抛 APIError（/ai 图片识别用）。"""
+        request = urllib.request.Request(self.file_base + file_path)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            raise APIError('download', {'error_code': exc.code,
+                                        'description': 'File download failed'}) from None
+        except (OSError, urllib.error.URLError):
+            raise APIError('download', {'error_code': 503, 'description': 'Network failure'}) from None
