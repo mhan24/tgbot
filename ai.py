@@ -26,7 +26,7 @@ TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone'
 TYPESAFE_MODEL = 'jev-latest'
 EXA_URL = 'https://api.exa.ai/search'
 DEFAULT_TIMEOUT = 60
-MAX_TOKENS = 1500
+MAX_TOKENS = 4000
 MAX_QUESTION = 1000
 MAX_ANSWER = 3500
 SEARCH_RESULTS = 3
@@ -226,14 +226,13 @@ class AI:
 
     def _answer(self, messages):
         data = self._chat(messages)
-        answer = self._content(data) or self._reasoning(data)
+        answer = self._content(data)
         if not answer:
-            # 网关偶尔只返回推理过程、没有正文：先直接用推理内容兜底；
-            # 推理也没有时才补一次收尾请求，仍为空才报错。
+            # 网关偶尔只返回推理过程、没有正文：补一次收尾请求，仍为空才报错。
             LOG.info('Empty answer from model; asking for a final reply once')
             data = self._chat(messages + [{
                 'role': 'user', 'content': '请直接给出最终回答，不要输出推理过程。'}])
-            answer = self._content(data) or self._reasoning(data)
+            answer = self._content(data)
         if not answer:
             raise AIError(EMPTY)
         return answer, str(data.get('model') or self.model)
@@ -263,12 +262,6 @@ class AI:
         choices = data.get('choices') or []
         message = ((choices[0] or {}).get('message') if choices else None) or {}
         return str(message.get('content') or '').strip()
-
-    @staticmethod
-    def _reasoning(data):
-        choices = data.get('choices') or []
-        message = ((choices[0] or {}).get('message') if choices else None) or {}
-        return str(message.get('reasoning_content') or '').strip()
 
     # --- 联网搜索 ---------------------------------------------------------
 
