@@ -28,6 +28,9 @@ from verification import MAX_ATTEMPTS, Verification
 LOG = logging.getLogger('groupbot')
 
 DEFAULT_GROUP = -1003014905211
+KEYWORD_USAGE = ('/bankeyword add 关键字 — 添加\n'
+                 '/bankeyword remove 关键字 — 移除\n'
+                 '/bankeyword list — 查看')
 DEFAULT_VERIFY_SECONDS = 240
 MIN_VERIFY_SECONDS = 30
 MAX_VERIFY_SECONDS = 300
@@ -82,6 +85,7 @@ class Bot:
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER,actor INTEGER,
           target INTEGER,action TEXT,detail TEXT);
         CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
+        CREATE TABLE IF NOT EXISTS ban_keywords(keyword TEXT PRIMARY KEY NOT NULL);
         ''')
         self.verification = Verification(self)
         self.exchange = Exchange(self.db)
@@ -326,6 +330,8 @@ class Bot:
         if payload:
             chat = payload.get('chat') or {}
             return chat.get('type') == 'private' or chat.get('id') == self.group
+        if edited := update.get('edited_message'):
+            return (edited.get('chat') or {}).get('id') == self.group
         query = update.get('callback_query')
         if query:
             chat = (query.get('message') or {}).get('chat') or {}
@@ -349,14 +355,33 @@ class Bot:
         if 'chat_member' in update:
             self.member_update(update['chat_member'])
             return
+        if edited := update.get('edited_message'):
+            self.ban_for_keyword(edited)
+            return
         message = update.get('message')
         if not message:
             return
-        self.remember(message)
         if (message.get('chat') or {}).get('type') == 'private':
             self.private_message(message)
-        else:
+        elif not self.ban_for_keyword(message):
+            self.remember(message)
             self.group_message(message)
+
+    def ban_for_keyword(self, message):
+        text = message.get('text', message.get('caption'))
+        if not text or message.get('sender_chat'):
+            return False
+        sender = message.get('from') or {}
+        uid = sender.get('id')
+        if not uid or uid == self.bot_id or sender.get('is_bot'):
+            return False
+        if not self.db.execute('SELECT 1 FROM ban_keywords WHERE keyword=?', (text,)).fetchone() or self.admin(uid):
+            return False
+        self.call('banChatMember', chat_id=self.group, user_id=uid)
+        # 验证超时会先封禁再解封，关键字封禁后需要取消未完成的验证。
+        self.verification.forget(uid)
+        self.audit(0, uid, 'keyword_ban', text)
+        return True
 
     def member_update(self, event):
         if (event.get('chat') or {}).get('id') != self.group:
@@ -383,6 +408,8 @@ class Bot:
             self.rate_reply(message)
         elif name == '/bin':
             self.bin_reply(message)
+        elif name == '/bankeyword':
+            self.keyword_command(message)
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
@@ -414,6 +441,9 @@ class Bot:
         if name == '/bin':
             self.bin_reply(message)
             return
+        if name == '/bankeyword':
+            self.keyword_command(message)
+            return
         if not name:
             # AI 问答只通过群聊 @机器人 触发：提及即提问，问题取去掉提及后的正文。
             question = self.mention_question(message)
@@ -422,6 +452,51 @@ class Bot:
                 return
         if name:
             self.send(chat_id, '尚未提供这个命令，发送 /help 查看可用功能。')
+
+    def keyword_command(self, message):
+        chat = message['chat']['id']
+        uid = (message.get('from') or {}).get('id')
+        if not uid or not self.admin(uid):
+            self.send(chat, '只有群主和群管理员可以管理拉黑关键字。')
+            return
+        _, *args = message['text'].split(maxsplit=1)
+        action, *words = re.split(r'\s', args[0] if args else '', maxsplit=1)
+        action = action.lower()
+        keyword = words[0] if words else ''
+        if action == 'list' and not keyword.strip():
+            self.list_keywords(chat)
+            return
+        if action not in ('add', 'remove') or not keyword.strip():
+            self.send(chat, KEYWORD_USAGE)
+            return
+        if action == 'add':
+            sql = 'INSERT INTO ban_keywords(keyword) VALUES(?) ON CONFLICT(keyword) DO NOTHING'
+            success, unchanged = '已添加拉黑关键字，立即生效。', '这条关键字已在列表中。'
+        else:
+            sql = 'DELETE FROM ban_keywords WHERE keyword=?'
+            success, unchanged = '已移除拉黑关键字，立即生效。', '列表中没有这条关键字。'
+        with self.db:
+            changed = self.db.execute(sql, (keyword,)).rowcount
+            if changed:
+                self.audit(uid, 0, f'keyword_{action}', keyword)
+        self.send(chat, success if changed else unchanged)
+
+    def list_keywords(self, chat):
+        keywords = self.db.execute('SELECT keyword FROM ban_keywords ORDER BY keyword').fetchall()
+        if not keywords:
+            self.send(chat, '还没有拉黑关键字。用 /bankeyword add 关键字 添加一条。')
+            return
+        title = '拉黑关键字'
+        page = [f'<b>{title}</b>']
+        size = len(title)
+        for (keyword,) in keywords:
+            length = len(keyword.encode('utf-16-le')) // 2
+            if size + length + 1 > 4096:
+                self.send(chat, '\n'.join(page))
+                page, size = [], 0
+            page.append(f'<code>{html.escape(keyword)}</code>')
+            size += length + 1
+        self.send(chat, '\n'.join(page))
 
     def command_name(self, message):
         """命令名；``/cmd@其他机器人`` 与普通文字都返回空串（静默忽略）。"""
@@ -626,7 +701,8 @@ class Bot:
                 '/start — 私聊开始使用\n'
                 '/help — 查看本说明\n'
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
-                '/bin — 卡 BIN 查询：/bin 45717360\n\n'
+                '/bin — 卡 BIN 查询：/bin 45717360\n'
+                '/bankeyword — 管理拉黑关键字（群主和管理员可用）\n\n'
                 '<b>AI 问答</b>\n'
                 f'群里 @{html.escape(self.username)} 直接提问（可附图或引用图片），需要时可联网搜索。')
 
@@ -739,18 +815,18 @@ class Bot:
                  self.username, self.group, self.channel, self.verify_seconds,
                  'on' if self.ai.enabled else 'off', self.ai.model,
                  'exa' if self.ai.search_enabled else 'off')
+        allowed_updates = ['message', 'edited_message', 'chat_member', 'chat_join_request', 'callback_query']
         while True:
             try:
                 self.maintenance()
                 quick = self.pending_verification()
                 updates = self.call('getUpdates', offset=offset, timeout=1 if quick else 20,
-                                    allowed_updates=['message', 'chat_member', 'chat_join_request',
-                                                     'callback_query'])
+                                    allowed_updates=allowed_updates)
                 for update in updates:
                     update_id = update['update_id']
-                    payload = next((update[key] for key in ('message', 'chat_member', 'chat_join_request')
-                                    if key in update), {})
-                    event_time = payload.get('date', start_time)
+                    payload = next((update[key] for key in ('message', 'edited_message', 'chat_member',
+                                                            'chat_join_request') if key in update), {})
+                    event_time = payload.get('edit_date', payload.get('date', start_time))
                     if (self.accepts_update(update) and event_time >= start_time and
                             not self.db.execute('SELECT 1 FROM processed WHERE id=?',
                                                 (update_id,)).fetchone()):

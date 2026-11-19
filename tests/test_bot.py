@@ -3,8 +3,10 @@
 import io
 import json
 import sqlite3
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import bot as botmod
@@ -51,7 +53,7 @@ class CoreTests(unittest.TestCase):
         self.bot.handle(self.message(1, '/help'))
         sent = self.api.find('sendMessage')[-1]
         self.assertEqual(sent['parse_mode'], 'HTML')
-        for token in ('入群验证', '关联频道', '/start', '/help', '/rate', '/bin', '提问'):
+        for token in ('入群验证', '关联频道', '/start', '/help', '/rate', '/bin', '/bankeyword', '提问'):
             self.assertIn(token, sent['text'])
         for gone in ('原石', '抽卡', '黑名单', '/ai'):
             self.assertNotIn(gone, sent['text'])
@@ -354,7 +356,7 @@ class CoreTests(unittest.TestCase):
     def test_schema_holds_only_current_tables(self):
         tables = {row[0] for row in self.bot.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'meta', 'processed', 'audit',
+        self.assertEqual(tables, {'meta', 'processed', 'audit', 'ban_keywords',
                                   'verification', 'rates', 'bin_cache'})
         self.assertFalse(tables & {'point_users', 'point_events', 'checkin_pity', 'checkin_draws',
                                    'mutes', 'upgrades', 'private_steps', 'known_bots',
@@ -417,6 +419,127 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(bot.channel_url, expected)
 
 
+class KeywordBanTests(unittest.TestCase):
+    def setUp(self):
+        self.bot, self.api = make_bot()
+        self.addCleanup(self.bot.db.close)
+        with self.bot.db:
+            self.bot.db.executemany('INSERT INTO ban_keywords VALUES(?)', [('Spam',), ('广告,口令',)])
+
+    def test_only_exact_group_text_is_banned(self):
+        for mid, text in enumerate(('spam', ' Spam', 'Spam ', 'Spam\n', '前缀Spam', 'Spam!'), 1):
+            self.bot.handle(group_message(mid, text))
+        self.assertEqual(self.api.calls, [])
+
+        self.bot.handle(group_message(10, 'Spam'))
+        self.assertEqual(self.api.find('banChatMember'), [
+            {'chat_id': GROUP, 'user_id': 2, 'revoke_messages': True},
+        ])
+        row = self.bot.db.execute('SELECT target, action, detail FROM audit').fetchone()
+        self.assertEqual(tuple(row), (2, 'keyword_ban', 'Spam'))
+        self.assertNotIn(10, [item['id'] for item in self.bot._recent[GROUP]])
+
+    def test_admins_bots_channel_senders_and_other_chats_are_exempt(self):
+        self.api.members[2] = {'status': 'administrator'}
+        self.bot.handle(group_message(1, 'Spam'))
+        self.bot.handle(group_message(2, 'Spam', **{'from': {'id': 3, 'is_bot': True}}))
+        self.bot.handle(group_message(3, 'Spam', sender_chat={'id': -10, 'type': 'channel'}))
+        for chat in ({'id': 4, 'type': 'private'}, {'id': -3, 'type': 'supergroup'}):
+            self.bot.handle(group_message(4, 'Spam', chat=chat))
+        self.assertEqual(self.api.methods(), ['getChatMember'])
+
+    def test_polling_bans_an_edited_caption_using_the_edit_timestamp(self):
+        self.api.channel_status = 'administrator'
+        self.api.members[BOT_ID] = {'status': 'creator'}
+        with self.bot.db:
+            self.bot.db.execute("INSERT INTO meta VALUES('start_time', '100')")
+        edited = group_message(8, None, caption='广告,口令', date=99, edit_date=101)['message']
+        del edited['text']
+        call = self.api.call
+        polls = []
+
+        def poll(method, **data):
+            if method != 'getUpdates':
+                return call(method, **data)
+            polls.append(data)
+            if len(polls) == 1:
+                return [{'update_id': 8, 'edited_message': edited}]
+            raise KeyboardInterrupt
+
+        with patch.object(self.api, 'call', side_effect=poll), self.assertRaises(KeyboardInterrupt):
+            self.bot.run()
+        self.assertIn('edited_message', polls[0]['allowed_updates'])
+        self.assertEqual(polls[1]['offset'], 9)
+        self.assertEqual([data['user_id'] for data in self.api.find('banChatMember')], [2])
+
+    def test_expired_verification_cannot_unban_the_member(self):
+        self.bot.verification.admit({'id': 2, 'first_name': 'U'}, 'member', GROUP)
+        self.bot.handle(group_message(1, 'Spam'))
+        with patch('verification.time.time', return_value=time.time() + self.bot.verify_seconds + 1):
+            self.bot.verification.tick()
+        self.assertFalse(self.bot.verification.pending(2))
+        self.assertEqual(len(self.api.find('banChatMember')), 1)
+        self.assertEqual(self.api.find('unbanChatMember'), [])
+
+
+class KeywordCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.cfg = {'GROUP_ID': str(GROUP), 'CHANNEL_ID': str(CHANNEL),
+                    'DB_PATH': str(Path(self.directory.name) / 'bot.sqlite3')}
+        self.api = FakeAPI()
+        self.bot = Bot(self.cfg, self.api)
+        self.bot.bot_id, self.bot.username = BOT_ID, BOT_USERNAME
+        self.addCleanup(self.bot.db.close)
+        self.api.members[7] = {'status': 'creator'}
+
+    def command(self, text, uid=7, private=False):
+        chat = {'id': uid, 'type': 'private'} if private else {'id': GROUP, 'type': 'supergroup'}
+        command = f'/bankeyword {text}' if text else '/bankeyword'
+        self.bot.handle(group_message(1, command, uid=uid, chat=chat))
+        return self.api.texts()[-1]
+
+    def test_admin_can_add_list_and_remove_an_exact_keyword(self):
+        self.assertIn('/bankeyword add', self.command(''))
+        self.assertIn('还没有', self.command('list'))
+        keyword = ' offer <&>  now '
+        self.assertIn('已添加', self.command(f'add {keyword}'))
+        self.assertIn('已在列表中', self.command(f'add {keyword}', private=True))
+        self.assertIn('<code> offer &lt;&amp;&gt;  now </code>', self.command('list', private=True))
+        self.assertEqual(self.api.find('sendMessage')[-1]['chat_id'], 7)
+
+        reopened = Bot(self.cfg, self.api)
+        self.addCleanup(reopened.db.close)
+        reopened.handle(group_message(2, keyword.strip(), uid=2))
+        self.assertEqual(self.api.find('banChatMember'), [])
+        reopened.handle(group_message(3, keyword, uid=2))
+        self.assertEqual([data['user_id'] for data in self.api.find('banChatMember')], [2])
+
+        self.assertIn('已移除', self.command(f'remove {keyword}', private=True))
+        self.assertIn('没有这条', self.command(f'remove {keyword}'))
+        reopened.handle(group_message(4, keyword, uid=3))
+        self.assertEqual([data['user_id'] for data in self.api.find('banChatMember')], [2])
+        actions = self.bot.db.execute('SELECT actor, action FROM audit WHERE actor != 0 ORDER BY id')
+        self.assertEqual([tuple(row) for row in actions], [(7, 'keyword_add'), (7, 'keyword_remove')])
+
+    def test_non_admin_cannot_manage_or_read_keywords(self):
+        self.command('add Spam')
+        for private in (False, True):
+            for args in ('add extra', 'remove Spam', 'list'):
+                self.assertIn('只有群主和群管理员', self.command(args, uid=2, private=private))
+        self.assertEqual(self.command('list'), '<b>拉黑关键字</b>\n<code>Spam</code>')
+
+    def test_long_list_is_split_without_cutting_keywords(self):
+        keywords = [char * 2000 for char in 'ABC']
+        for keyword in keywords:
+            self.command(f'add {keyword}')
+        self.api.clear()
+        self.command('list')
+        self.assertEqual(self.api.texts(), [f'<b>拉黑关键字</b>\n<code>{keywords[0]}</code>\n'
+                                            f'<code>{keywords[1]}</code>', f'<code>{keywords[2]}</code>'])
+
+
 class TransportTests(unittest.TestCase):
     def test_invalid_payload_is_retryable_and_hides_token(self):
         for payload in (b'invalid', b'[]', b'{"ok":true}'):
@@ -461,8 +584,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config('/nonexistent.env')['TELEGRAM_BOT_TOKEN'], 'env-token')
 
     def test_missing_configuration_reads_file(self):
-        import tempfile
-        from pathlib import Path
         with patch.dict('os.environ', {}, clear=True), tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '.env'
             path.write_text('TELEGRAM_BOT_TOKEN=file-token\nGROUP_ID=-1\nCHANNEL_ID=-2\n')
