@@ -1,5 +1,7 @@
 # coding: utf-8
-"""AI 问答：OpenAI 兼容网关生成回答，TypeSafe（Jev）只判断是否需要联网，Exa 执行搜索。
+"""AI 问答：OpenAI 兼容网关生成回答，TypeSafe（Jev）判断是否需要联网，Exa 执行搜索。
+
+Jev 还负责群消息的广告判定（``ad_verdict``），由 adguard 在后台线程调用。
 
 流程：问题 → Jev 判定是否需要时效信息 → 需要则用 Exa 取 3 条结果 → 把结果作为上下文
 交给模型总结回答。判定不可用时默认联网（宁可多搜一次，不用旧知识冒充最新事实），
@@ -54,6 +56,13 @@ SEARCH_CRITERIA = {'true': '必须依赖最新的外部事实才能准确回答�
                    'false': '用稳定的常识、推理或定义就能准确回答。'}
 SEARCH_LABELS = {'off': '未联网（未启用搜索）', 'skipped': '未联网',
                  'empty': '已联网（无结果）', 'failed': '联网失败'}
+AD_THRESHOLD = 0.8  # 广告判定的默认概率阈值：误判会删人消息，宁可放过也不错杀
+AD_CHARS = 2000     # 交给广告判定的消息文本上限
+AD_QUESTION = '这条 Telegram 群消息是不是广告或推广引流？'
+AD_CRITERIA = {'true': ('在推销商品或服务、招揽生意、引流到其他群/频道/私聊/网站，'
+                        '或发布兼职、刷单、博彩、代充、返利、投资带单等推广信息。'),
+               'false': ('正常聊天、提问、讨论或分享经验；即使提到产品、价格或链接，'
+                         '也没有招揽或引流的意图。')}
 SEARCH_CONTEXT = ('以下是刚检索到的网页结果，可能不完整或已经过时。只采用与问题相关的结果，'
                   '引用时给出纯文本链接；结果与问题无关或不足以回答时忽略检索结果，'
                   '基于聊天记录和已有知识回答，并如实说明，不要编造内容。')
@@ -92,6 +101,10 @@ class AI:
     @property
     def search_enabled(self):
         return bool(self.exa_key)
+
+    @property
+    def ad_enabled(self):
+        return bool(self.typesafe_key)
 
     def ask(self, question, context=None, image=None):
         """回答一个问题，返回可直接发送的 HTML 文本列表（长回答拆分为多条）。
@@ -205,27 +218,48 @@ class AI:
         """
         if not self.typesafe_key:
             return {}, 'off'
-        body = {'model': self.typesafe_model, 'state': probe,
-                'questions': {'needs_web_search': {'type': 'noul',
-                                                   'instructions': SEARCH_QUESTION,
-                                                   'criteria': SEARCH_CRITERIA}}}
+        probability = self._noul('needs_web_search', probe, SEARCH_QUESTION, SEARCH_CRITERIA,
+                                 self._timeout(min(self.timeout, AUX_TIMEOUT), deadline))
+        if probability is None:
+            return {}, 'failed'
+        return {'needs_web_search': (probability >= SEARCH_THRESHOLD, probability)}, 'ok'
+
+    def ad_verdict(self, text, threshold=AD_THRESHOLD):
+        """一次 TypeSafe 调用判定群消息是否为广告。
+
+        返回 (是否广告, 概率)；未配置判定模型、文本为空或判定失败返回 None，
+        调用方按“不是广告”处理。只发 HTTP 请求，可在后台线程调用。
+        """
+        text = (text or '').strip()[:AD_CHARS]
+        if not self.typesafe_key or not text:
+            return None
+        probability = self._noul('is_ad', text, AD_QUESTION, AD_CRITERIA,
+                                 min(self.timeout, AUX_TIMEOUT))
+        if probability is None:
+            return None
+        return probability >= threshold, probability
+
+    def _noul(self, name, state, instructions, criteria, timeout):
+        """TypeSafe Noul 单问题判定，返回“是”的概率；失败返回 None。"""
+        body = {'model': self.typesafe_model, 'state': state,
+                'questions': {name: {'type': 'noul', 'instructions': instructions,
+                                     'criteria': criteria}}}
         try:
             payload = self._post(TYPESAFE_URL, body,
                                  {'Authorization': 'Bearer ' + self.typesafe_key},
-                                 timeout=self._timeout(min(self.timeout, AUX_TIMEOUT), deadline))
+                                 timeout=timeout)
         except AIError as exc:
-            LOG.warning('TypeSafe judgment failed code=%s', exc.code)
-            return {}, 'failed'
+            LOG.warning('TypeSafe judgment %s failed code=%s', name, exc.code)
+            return None
         answers = payload.get('answers') if isinstance(payload, dict) else None
         answers = answers if isinstance(answers, dict) else {}
-        answer = answers.get('needs_web_search')
+        answer = answers.get(name)
         probability = (answer or {}).get('noul') if isinstance(answer, dict) else None
         try:
-            probability = float(probability)
+            return float(probability)
         except (TypeError, ValueError):
-            LOG.warning('TypeSafe judgment needs_web_search returned an unexpected answer')
-            return {}, 'failed'
-        return {'needs_web_search': (probability >= SEARCH_THRESHOLD, probability)}, 'ok'
+            LOG.warning('TypeSafe judgment %s returned an unexpected answer', name)
+            return None
 
     # --- 生成回答 ---------------------------------------------------------
 
