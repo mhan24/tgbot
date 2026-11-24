@@ -356,7 +356,7 @@ class CoreTests(unittest.TestCase):
     def test_schema_holds_only_current_tables(self):
         tables = {row[0] for row in self.bot.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'meta', 'processed', 'audit', 'ad_warnings',
+        self.assertEqual(tables, {'meta', 'processed', 'audit', 'ad_warnings', 'ad_whitelist',
                                   'verification', 'rates', 'bin_cache'})
         self.assertFalse(tables & {'point_users', 'point_events', 'checkin_pity', 'checkin_draws',
                                    'mutes', 'upgrades', 'private_steps', 'known_bots',

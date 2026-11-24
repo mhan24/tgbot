@@ -47,6 +47,7 @@ class AdGuardTests(unittest.TestCase):
             self.settle()
             self.assertEqual(self.warnings(), mid)
             self.assertIn(f'警告 {mid}/{MAX_WARNINGS}', self.api.texts()[-1])
+            self.assertIn('jev-latest 判定值 0.95（阈值 0.80）', self.api.texts()[-1])
         self.assertEqual(self.api.find('banChatMember'), [])
         self.bot.handle(group_message(MAX_WARNINGS, '加V领福利'))
         self.settle()
@@ -57,6 +58,7 @@ class AdGuardTests(unittest.TestCase):
         self.assertEqual(self.api.find('unbanChatMember'),
                          [{'chat_id': GROUP, 'user_id': 2, 'only_if_banned': True}])
         self.assertIn('移出本群', self.api.texts()[-1])
+        self.assertIn('判定值 0.95', self.api.texts()[-1])
         self.assertEqual(self.warnings(), 0)
         actions = [r[0] for r in self.bot.db.execute('SELECT action FROM audit ORDER BY id')]
         self.assertEqual(actions, ['ad_warning'] * MAX_WARNINGS + ['ad_kick'])
@@ -123,6 +125,101 @@ class AdGuardTests(unittest.TestCase):
         self.bot.ads.jobs.join()
         self.bot.maintenance()
         self.assertFalse(self.bot.ads.busy())
+
+
+class AdCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.bot, self.api = make_bot(TYPESAFE_API_KEY='t')
+        self.addCleanup(self.bot.db.close)
+        self.api.members[7] = {'status': 'administrator', 'user': {'id': 7, 'first_name': 'Admin'}}
+        self.api.members[5] = {'status': 'member', 'user': {'id': 5, 'first_name': 'Five'}}
+        self.judged = []
+
+        def verdict(text, threshold):
+            self.judged.append(text)
+            ad = '广告' in text or '福利' in text
+            return ad, 0.97 if ad else 0.05
+
+        patch.object(self.bot.ai, 'ad_verdict', side_effect=verdict).start()
+        self.addCleanup(patch.stopall)
+
+    def command(self, text, uid=7, private=False, reply_uid=0):
+        chat = {'id': uid, 'type': 'private'} if private else {'id': GROUP, 'type': 'supergroup'}
+        extra = {'reply_to_message': {'message_id': 50, 'from': {'id': reply_uid, 'first_name': 'R'},
+                                      'text': 'x'}} if reply_uid else {}
+        self.bot.handle(group_message(100, text, uid=uid, chat=chat, **extra))
+        self.bot.ads.jobs.join()
+        self.bot.ads.drain()
+        return self.api.texts()[-1]
+
+    def warn(self, uid, count=1):
+        with self.bot.db:
+            self.bot.db.execute('INSERT OR REPLACE INTO ad_warnings VALUES(?,?,0)', (uid, count))
+
+    def warnings(self, uid):
+        row = self.bot.db.execute('SELECT count FROM ad_warnings WHERE uid=?', (uid,)).fetchone()
+        return row[0] if row else 0
+
+    def test_whitelist_by_reply_skips_checks_and_clears_warnings(self):
+        self.warn(2, 2)
+        self.assertIn('加入广告白名单', self.command('/whitelist add', reply_uid=2))
+        self.assertIn('已清空', self.api.texts()[-1])
+        self.assertEqual(self.warnings(2), 0)
+        self.assertIn('已在广告白名单中', self.command('/whitelist add', reply_uid=2))
+        self.judged.clear()
+        self.bot.handle(group_message(1, '加V领福利', uid=2))
+        self.bot.ads.jobs.join()
+        self.bot.ads.drain()
+        self.assertEqual(self.judged, [])
+        self.assertIn('移出广告白名单', self.command('/whitelist remove', reply_uid=2))
+        self.assertIn('不在广告白名单中', self.command('/whitelist remove', reply_uid=2))
+        self.judged.clear()
+        self.bot.handle(group_message(2, '加V领福利', uid=2))
+        self.bot.ads.jobs.join()
+        self.assertEqual(self.judged, ['加V领福利'])
+
+    def test_whitelist_by_id_in_private_and_list(self):
+        self.assertIn('空的', self.command('/whitelist list', private=True))
+        self.assertIn('加入广告白名单', self.command('/whitelist add 5', private=True))
+        self.assertEqual(self.command('/whitelist list', private=True),
+                         '<b>广告白名单</b>\nFive <code>5</code>')
+        self.assertIn('请回复', self.command('/whitelist add', private=True))
+        self.assertIn('请回复', self.command('/whitelist add bob', private=True))
+        self.assertIn('/whitelist add', self.command('/whitelist', private=True))
+
+    def test_whitelisted_during_judgment_is_not_warned(self):
+        self.bot.handle(group_message(1, '广告', uid=2))
+        self.bot.ads.jobs.join()
+        with self.bot.db:
+            self.bot.db.execute("INSERT INTO ad_whitelist VALUES(2,'',7,0)")
+        self.bot.ads.drain()
+        self.assertEqual(self.api.find('deleteMessage'), [])
+
+    def test_clearwarn_one_member_or_everyone(self):
+        self.warn(2, 2)
+        self.warn(3, 1)
+        self.assertIn('已清空', self.command('/clearwarn', reply_uid=2))
+        self.assertIn('2 次', self.api.texts()[-1])
+        self.assertEqual(self.warnings(2), 0)
+        self.assertEqual(self.warnings(3), 1)
+        self.assertIn('没有广告警告', self.command('/clearwarn 2', private=True))
+        self.assertIn('/clearwarn all', self.command('/clearwarn'))
+        self.assertIn('1 人', self.command('/clearwarn all', private=True))
+        self.assertEqual(self.warnings(3), 0)
+        actions = [r[0] for r in self.bot.db.execute(
+            'SELECT action FROM audit WHERE actor=7 ORDER BY id')]
+        self.assertEqual(actions, ['ad_clear', 'ad_clear'])
+
+    def test_non_admins_cannot_manage(self):
+        for text in ('/whitelist add 5', '/whitelist list', '/clearwarn all'):
+            for private in (False, True):
+                self.assertIn('只有群主和群管理员', self.command(text, uid=2, private=private))
+        self.assertFalse(self.bot.ads.whitelisted(5))
+
+    def test_help_lists_admin_commands(self):
+        text = self.bot.help_text()
+        self.assertIn('/whitelist', text)
+        self.assertIn('/clearwarn', text)
 
 
 class AdVerdictTests(unittest.TestCase):

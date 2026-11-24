@@ -400,9 +400,13 @@ class Bot:
             self.rate_reply(message)
         elif name == '/bin':
             self.bin_reply(message)
+        elif name in self.AD_COMMANDS:
+            self.ads.command(message, name)
         elif name:
             # 只有未知命令才回复，纯文字不回应，避免被用来刷接口配额。
             self.send(uid, '尚未提供这个命令，发送 /help 查看可用功能。')
+
+    AD_COMMANDS = ('/whitelist', '/clearwarn')
 
     def group_message(self, message):
         chat_id = message['chat']['id']
@@ -430,6 +434,9 @@ class Bot:
             return
         if name == '/bin':
             self.bin_reply(message)
+            return
+        if name in self.AD_COMMANDS:
+            self.ads.command(message, name)
             return
         if not name:
             # AI 问答只通过群聊 @机器人 触发：提及即提问，问题取去掉提及后的正文。
@@ -645,7 +652,10 @@ class Bot:
                 '/rate — 汇率换算：/rate 100 USD CNY\n'
                 '/bin — 卡 BIN 查询：/bin 45717360\n\n'
                 + (f'<b>广告检查</b>\n群消息会自动检查，判定为广告的消息会被删除并警告；'
-                   f'累计 {AD_WARNINGS} 次警告将被移出本群。\n\n' if self.ads.enabled else '') +
+                   f'累计 {AD_WARNINGS} 次警告将被移出本群。\n'
+                   '/whitelist — 广告白名单（群主和管理员可用）\n'
+                   '/clearwarn — 清空广告警告（群主和管理员可用）\n\n'
+                   if self.ads.enabled else '') +
                 '<b>AI 问答</b>\n'
                 f'群里 @{html.escape(self.username)} 直接提问（可附图或引用图片），需要时可联网搜索。')
 
