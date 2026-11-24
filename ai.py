@@ -56,7 +56,7 @@ SEARCH_CRITERIA = {'true': '必须依赖最新的外部事实才能准确回答�
                    'false': '用稳定的常识、推理或定义就能准确回答。'}
 SEARCH_LABELS = {'off': '未联网（未启用搜索）', 'skipped': '未联网',
                  'empty': '已联网（无结果）', 'failed': '联网失败'}
-AD_THRESHOLD = 0.8  # 广告判定的默认概率阈值：误判会删人消息，宁可放过也不错杀
+AD_THRESHOLD = 0.95  # 广告判定的默认概率阈值：误判会删人消息，宁可放过也不错杀
 AD_CHARS = 2000     # 交给广告判定的消息文本上限
 AD_QUESTION = '这条 Telegram 群消息是不是广告或推广引流？'
 AD_CRITERIA = {'true': ('在推销商品或服务、招揽生意、引流到其他群/频道/私聊/网站，'

@@ -41,13 +41,13 @@ class AdGuardTests(unittest.TestCase):
         self.assertEqual(self.warnings(), 0)
 
     def test_ad_is_deleted_and_warned_then_kicked_on_third_warning(self):
-        self.verdicts['加V领福利'] = 0.95
+        self.verdicts['加V领福利'] = 0.96
         for mid in range(1, MAX_WARNINGS):
             self.bot.handle(group_message(mid, '加V领福利'))
             self.settle()
             self.assertEqual(self.warnings(), mid)
             self.assertIn(f'警告 {mid}/{MAX_WARNINGS}', self.api.texts()[-1])
-            self.assertIn('jev-latest 判定值 0.95（阈值 0.80）', self.api.texts()[-1])
+            self.assertIn('jev-latest 判定值 0.96（阈值 0.95）', self.api.texts()[-1])
         self.assertEqual(self.api.find('banChatMember'), [])
         self.bot.handle(group_message(MAX_WARNINGS, '加V领福利'))
         self.settle()
@@ -58,13 +58,13 @@ class AdGuardTests(unittest.TestCase):
         self.assertEqual(self.api.find('unbanChatMember'),
                          [{'chat_id': GROUP, 'user_id': 2, 'only_if_banned': True}])
         self.assertIn('移出本群', self.api.texts()[-1])
-        self.assertIn('判定值 0.95', self.api.texts()[-1])
+        self.assertIn('判定值 0.96', self.api.texts()[-1])
         self.assertEqual(self.warnings(), 0)
         actions = [r[0] for r in self.bot.db.execute('SELECT action FROM audit ORDER BY id')]
         self.assertEqual(actions, ['ad_warning'] * MAX_WARNINGS + ['ad_kick'])
 
     def test_below_threshold_is_not_an_ad(self):
-        self.verdicts['有点像广告'] = 0.7
+        self.verdicts['有点像广告'] = 0.94
         self.bot.handle(group_message(1, '有点像广告'))
         self.settle()
         self.assertEqual(self.api.find('deleteMessage'), [])
@@ -227,9 +227,9 @@ class AdVerdictTests(unittest.TestCase):
         ai = aimod.AI(api_key='k', typesafe_key='t')
         calls = []
         with patch('httpjson.urllib.request.urlopen',
-                   side_effect=json_response({'answers': {'is_ad': {'noul': 0.85}}}, calls)):
-            self.assertEqual(ai.ad_verdict('加群领福利'), (True, 0.85))
-            self.assertEqual(ai.ad_verdict('加群领福利', 0.9), (False, 0.85))
+                   side_effect=json_response({'answers': {'is_ad': {'noul': 0.96}}}, calls)):
+            self.assertEqual(ai.ad_verdict('加群领福利'), (True, 0.96))
+            self.assertEqual(ai.ad_verdict('加群领福利', 0.99), (False, 0.96))
         self.assertLessEqual(calls[0][1], aimod.AUX_TIMEOUT)
 
     def test_missing_key_empty_text_or_bad_answer_returns_none(self):
